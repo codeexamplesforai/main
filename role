@@ -1,0 +1,206 @@
+ROLE 1
+Data & Platform Engineer
+Level: Intermediate to Expert
+ROLE SUMMARY
+Owns the end-to-end data infrastructure: real-time streaming, Spark/PySpark batch + structured-streaming, Delta Lake storage, the Feature Store, and platform operations. Ensures every transaction, KYC record, and sanctions update flows reliably from source systems into the Feature Store, Delta Lake, and Graph DB where ML models consume them — sub-second latency on the real-time path, daily completeness on the batch path.
+RESPONSIBILITIES
+•	Real-time ingestion: Kafka (KRaft mode, 3+ brokers, Avro Schema Registry), Flink streaming jobs (now scoped to lightweight on-demand single-batch evaluations triggered by analysts), Debezium CDC connectors from core banking and KYC systems
+•	Primary batch & micro-batch pipeline: Spark / PySpark on Delta Lake (MinIO) — feature computation, scoring orchestration, materialisation jobs, partitioned by entity type and date, Delta time-travel for regulatory back-testing
+•	Spark Structured Streaming consumers for aml.signal_payloads and downstream Layer-3/Layer-4 topics
+•	Airflow DAGs (aml_detection_pipeline and friends): nightly + 4-hourly delta runs, Kafka sensors, REST-triggered ad-hoc runs, backfills, retraining DAGs, sandbox simulations
+•	dbt transformations and data-quality tests on Delta tables
+•	Feature Store: Feast in on-prem mode, backed by MinIO (offline) + Redis Cluster (online, HSET-based serving); materialisation jobs that push fresh features from Delta into Redis after each batch
+•	Dual-mode Feature Factory: daily batch for stable features (KYC, demographics) + real-time/streaming computation for volatile features (velocity, amount clustering)
+•	Avro Schema Registry: schema management, backward-compatibility enforcement, data-contract validation across every Kafka topic (aml.txn, aml.kyc, aml.lists, aml.signal_payloads, aml.entity_risk, aml.decisions, …)
+•	Coverage Meta-Monitor: auditing 100% of transaction types/channels/products are flowing; dead-letter Delta tables and pipeline-halt logic on schema/contract failures (P4 incident path)
+•	Platform infrastructure: on-prem Kubernetes (single cluster, multi-namespace: aml-data, aml-storage, aml-ml, aml-serving, aml-observability, aml-sandbox), Helm charts, ArgoCD / GitOps deployments, CI/CD pipelines, Prometheus + Grafana, ELK (Elasticsearch + Logstash + Kibana) for centralised logging, GPU node provisioning with separate sandbox quotas
+REQUIRED SKILLS
+•	Apache Kafka — topic design, partitioning, consumer groups, exactly-once, KRaft mode, Avro + Schema Registry
+•	Apache Spark / PySpark — batch and Structured Streaming, Delta Lake (ACID, time-travel, schema evolution, OPTIMIZE/Z-ORDER), executor tuning
+•	Apache Flink or Kafka Streams — stateful stream processing, windowed aggregations, watermarks, late-event handling
+•	CI/CD: Jenkins, GitLab CI, or GitHub Actions; GitOps with ArgoCD for cluster deployments
+•	Containerisation: Docker — multi-stage builds, registry management (ECR/Harbor)
+•	Apache Airflow — DAG design, sensors (incl. Kafka sensor), REST-trigger patterns, retry/alerting, backfills
+•	dbt — incremental models, tests
+•	Kubernetes (on-prem) — pods, HPA, Helm, resource quotas, priority classes, GPU scheduling
+•	Redis — feature-serving data structures, Cluster mode, TTL, HSET patterns
+•	MinIO (S3-compatible) operations — buckets, lifecycle, IAM
+•	Infrastructure as Code — Terraform or Pulumi
+•	Monitoring — Prometheus, Grafana, ELK (or Loki)
+•	Python (compulsory) — NumPy, Pandas, PySpark as the daily working language
+NICE TO HAVE
+•	Feast or Tecton (Feast on-prem strongly preferred)
+•	Debezium CDC configuration
+•	Neo4j ETL pipeline experience (graph builder)
+•	Cloud-native experience on AWS (EKS, MSK, Kinesis) or GCP (GKE, Pub/Sub, Dataflow) — useful for patterns even though target is on-prem
+•	Delta Lake internals; Apache Iceberg or Hudi for comparison
+•	ArgoCD / Argo Workflows / Argo Events
+
+ROLE 2
+ML Engineer 1
+Level: Intermediate to Expert
+RESPONSIBILITIES
+•	Transaction Neural Network (PyTorch): architecture, training, HPO, inference serving via BentoML (GPU runner pool) — replaces TorchServe as primary serving path; TorchServe/Triton remain acceptable as fallback knowledge
+•	Ensemble Model (XGBoost/LightGBM): meta-model fusing NN, GNN, rule, raw signals into a single calibrated score; served from BentoML CPU runner pool with adaptive micro-batching
+•	Unsupervised anomaly detection: AE / VAE (PyTorch) or isolation forest for zero-day patterns, drift management, peer-group calibration
+•	Multi-axis scoring at Transaction, Account, Client axes before aggregation
+•	Signal Aggregator (Layer 3): typology-specific aggregation, Recurrence Engine
+•	Dual-track escalation: Track A deterministic + Track B probabilistic ML consolidator
+•	5D Tuning Matrix (Country × Client Type × Product × Risk Level × Transaction Profile) — Bayesian smoothing, cold-start inheritance; parameters fetched per-scoring from Redis, sourced from PostgreSQL Global Tuning Matrix
+•	Calibration: Platt scaling, score-to-probability mapping, MC Dropout confidence intervals
+•	Retraining pipeline as an Airflow DAG with the four mandatory tasks; MLflow model registry managing five lifecycle stages; champion–challenger promotion via GitOps PR merged through ArgoCD
+•	BTL active learning, focal loss, SMOTE, stratified mini-batches
+•	Sandbox workflow: experiments tracked in Sandbox MLflow, outputs to dedicated Delta Lake partition tagged with simulation_run_id, read-only access to production stores
+REQUIRED SKILLS
+•	Python (compulsory) — NumPy, Pandas, Scikit-learn, PySpark for feature engineering at scale on Delta Lake
+•	PyTorch — architecture, custom losses (focal), training loops, GPU optimisation
+•	XGBoost / LightGBM — gradient-boosted trees, feature importance, SHAP
+•	MLOps: MLflow (experiment tracking + model registry, lifecycle stages), BentoML (runners, adaptive batching, CPU + GPU pools), A/B / champion–challenger via GitOps + ArgoCD
+•	Delta Lake basics — reading/writing partitions, time-travel for back-testing
+•	Statistical foundations — class imbalance, calibration theory, hypothesis testing
+•	Anomaly detection — autoencoders/VAEs, isolation forests, reconstruction loss, drift detection
+•	Model evaluation — PR curves, AUC-ROC, F-beta, lift charts
+NICE TO HAVE
+•	W&B alongside MLflow (the tech design uses both)
+•	Evidently AI or similar drift/monitoring platforms
+•	DVC or LakeFS for dataset versioning
+•	TorchServe / Triton / KServe (alternative serving paths)
+•	Financial-crime / fraud datasets, SHAP/LIME, time-series behavioural features
+
+ROLE 3
+ML Engineer 2: Graph & GNN Engineer
+Level: Intermediate to Expert
+RESPONSIBILITIES
+•	Knowledge Graph in Neo4j: schema (entity nodes, transaction edges, ownership, sanctions links, counterparty connections, corporate registry data)
+•	Graph ETL: build/maintain graph from raw sources (entity matching, dedup, dirty corporate registry data, incremental updates driven from Spark jobs writing to Delta Lake)
+•	Graph Neural Network (PyTorch Geometric) — architecture, message-passing, training on the entity graph, sub-graph extraction for inference; GNN inference served from BentoML GPU runner pool
+•	Network-level features: shell-company score, circular flow detection, sanctions proximity (N-hop), shared UBO discovery, community risk, betweenness, PageRank — recomputed weekly via Airflow + Spark + Neo4j
+•	Entity Resolution: deterministic + probabilistic + vector-embedding similarity for Customer 360
+•	Sub-graph extraction optimisation: k-hop neighbourhood from Neo4j must complete within 200ms for real-time scoring
+•	Cypher query optimisation at scale (50M+ nodes, 500M+ edges); the queries Graph RAG generates must execute efficiently
+•	Network Axis scoring: 4th evaluation axis — per-entity network risk + node embeddings, written to Delta Lake (aml.entity_risk companion tables) and pushed into Redis online features
+REQUIRED SKILLS
+•	Python (compulsory) — graph ETL, GNN training, Neo4j Python driver, PySpark for batch graph feature joins
+•	Neo4j — Cypher, modelling, indexes, APOC, bulk import
+•	PyG or DGL — GCN/GAT/GraphSAGE, mini-batch training, sub-graph sampling
+•	Graph algorithms — community detection, centrality, shortest path, cycles, temporal graphs
+•	Entity resolution — Jaro-Winkler/Levenshtein, blocking, probabilistic record linkage
+•	Data engineering fundamentals — messy data, dedup, incremental ETL on Delta Lake
+NICE TO HAVE
+•	Corporate registry data (OpenCorporates, Companies House, commercial)
+•	AML typologies involving network structures (layering, shell networks, smurfing)
+•	TigerGraph or Amazon Neptune
+•	Embedding-based entity matching (Sentence-BERT)
+•	BentoML packaging for GNN inference
+
+
+ROLE 4
+ML Engineer 3: LLM & RAG Engineer
+Level: Intermediate to Expert
+RESPONSIBILITIES
+•	Graph RAG pipeline: NL → Cypher → Neo4j subgraph → serialisation → LLM narrative
+•	Text RAG pipeline: BSA/AML manuals, FATF, FinCEN, past SARs → chunk → embed (E5/BERT) → vector DB → retrieval → LLM synthesis
+•	LLM Gateway: Claude API and/or on-prem vLLM, rate limiting, prompt caching, cost tracking, fallback handling — invoked from the Escalation Router for entities in the uncertain zone (score 0.4–0.7)
+•	Historical Context Engine — query PostgreSQL for past dispositions on related entities and feed them into agentic reasoning prompts
+•	Adverse Media NLP: real-time news → multilingual NER → entity resolution against client DB → risk classification → alert correlation
+•	Payment Reference NLP — LLM parsing of free-text payment fields, semantic TBML pattern detection
+•	SAR narrative auto-generation reformatted to FinCEN requirements
+•	Multi-agent disposition engine: Evidence + Compliance + Precedent agents
+•	Risk-mitigation questionnaire auto-fill
+•	Embedding pipeline: batch jobs (Airflow + Spark) → chunk → embed → upsert to vector DB; served via FastAPI / BentoML
+REQUIRED SKILLS
+•	Python (compulsory)
+•	LLM orchestration — LangChain or LangGraph, multi-step prompt chains, agents, tool calling
+•	Prompt engineering — system prompts, few-shot, CoT, output format control, hallucination mitigation
+•	Vector databases — Pinecone, pgvector, or Weaviate; hybrid search
+•	Embedding models — E5, BERT, Sentence-BERT, domain fine-tuning
+•	NLP fundamentals — multilingual NER, entity extraction, classification
+•	RAG architecture — chunking, retrieval evaluation (P/R/MRR), re-ranking, context-window management
+•	FastAPI / BentoML for serving NLP/LLM components
+•	Kafka consumer/producer patterns — Layer-4 reads from Kafka and publishes aml.decisions
+NICE TO HAVE
+•	On-prem LLM deployment — vLLM, LoRA fine-tuning
+•	Cypher / SPARQL generation from NL
+•	Compliance/regulatory document experience
+•	Multi-agent design patterns
+•	MLflow tracking for prompt/agent experiments
+
+
+
+
+
+
+
+
+
+
+ROLE 5
+Backend & Integration Engineer
+Level: Intermediate
+ROLE SUMMARY
+Owns every backend service that is not an ML model: Alert Service, Case Manager, API Gateway, Tuning Matrix data structure, alert de-dup, Signal Aggregator, rule-engine config, and all external system integrations. Builds the 'last mile' that makes ML outputs usable.
+RESPONSIBILITIES
+•	Alert Service: score → alert → tier routing → Kafka publish on aml.decisions / downstream topics; dual-track escalation (Track A deterministic + Track B ML consolidator)
+•	Case Manager backend: alert lifecycle state machine, SLA tracking, assignment routing — alert objects pushed via Kong API Gateway to the Case Management UI
+•	API Gateway: Kong — rate limiting, auth, routing across microservices (Kong is the chosen gateway in the tech design; AWS ALB removed as primary option but acceptable as alternate experience)
+•	Tuning Matrix backend: 5D threshold structure, PostgreSQL as system-of-record (Global Tuning Matrix), Redis as low-latency read cache, CRUD API, self-tuning from analyst feedback
+•	Alert De-duplication Engine — entity + temporal + transaction overlap, alert merging
+•	Signal Aggregator (Layer 3) backend — typology-specific rules, Recurrence Engine, threshold evaluation against the Tuning Matrix
+•	Rule Engine integration — Drools or custom Python rule engine, rule config API, versioning
+•	Feature Factory API — serving computed features as JSON via FastAPI, on-demand consumption by models and services; backed by Feast / Redis online store
+•	Model Config Registry (PostgreSQL) — table mapping each active production model to its scoring path; CRUD + audit
+•	External integrations — core banking, KYC, sanctions (OFAC/UN/EU), FinCEN BSA E-Filing API for SAR submission
+•	Workforce analytics backend — investigator metrics, skill-based routing, workload balancing, SLA dashboards
+•	Audit trail in PostgreSQL + Delta Lake — immutable logging of every score, feature snapshot, model version, decision, and config version
+REQUIRED SKILLS
+•	Python (FastAPI) — REST design, async, middleware (FastAPI is the standard in the tech design; Node.js/Express acceptable as supplementary)
+•	PostgreSQL — schema design, query optimisation, JSONB, migrations, versioned config tables
+•	Apache Kafka — Avro + Schema Registry, consumer/producer patterns, exactly-once, DLQs
+•	API design — REST conventions, versioning, JWT/OAuth, rate limiting
+•	Integration patterns — webhooks, retry with backoff, circuit breakers, idempotency
+•	State machine design — alert lifecycle, concurrent access, audit logging
+•	Docker — microservice containerisation, docker-compose, Dockerfile optimisation
+•	API documentation — OpenAPI / Swagger
+•	Kong (or similar API gateway) configuration
+•	Redis as a read-side cache for hot config (Tuning Matrix parameters)
+NICE TO HAVE
+•	Drools or similar BRMS
+•	FinCEN BSA E-Filing API experience
+•	Event-driven patterns (CQRS, event sourcing)
+•	Multi-tenant SaaS backend services
+•	GitOps / ArgoCD for service deployment
+•	gRPC and Protobuf alongside Avro
+
+ROLE 6
+QA & Security Engineer
+Level: Intermediate
+ROLE SUMMARY
+⚑ Can be a shared / on-demand resource initially; becomes critical as the system approaches production and regulatory review. Owns end-to-end QA across the full pipeline, data security and PII compliance, the pre-filing QA engine for SAR quality, and red-team testing.
+RESPONSIBILITIES
+•	Integration testing: end-to-end traces of a synthetic transaction from ingestion → features → scoring → alert → investigation context — across the full Kafka → Spark → Delta Lake → BentoML → Kong → Case Manager path
+•	Regression testing on every model update, rule change, threshold adjustment
+•	Red-team simulations of synthetic laundering — structuring, layering, shell networks, same-day attacks, wire stripping — executed in the dedicated aml-sandbox namespace using Sandbox Spark + Sandbox MLflow, with outputs landing in the dedicated Delta Lake simulation_run_id partition
+•	Pre-filing QA Engine for SAR completeness, consistency, regulatory compliance, dismissal justification, peer comparison
+•	SWIFT Message Integrity Analyzer — comparing payment messages at gateway entry/exit, detecting field stripping, blank originators, resubmission of blocked payments
+•	Data security — encryption at rest and in transit, PII handling (GDPR, banking secrecy), RBAC, immutable audit trails in PostgreSQL + Delta Lake
+•	Penetration testing coordination
+•	Model validation support — test data, bias datasets, benchmarking for SR 11-7
+•	Schema-contract testing against the Avro Schema Registry — backward-compatibility gates in CI
+•	GitOps PR review gates — quality checks that must pass before ArgoCD promotes a model from Staging → Production
+REQUIRED SKILLS
+•	Python — pytest, integration test frameworks, synthetic data generation
+•	Test architecture — distributed-system E2E testing, test data management, environment management
+•	Security fundamentals — AES, TLS, RBAC/ABAC, PII classification, data masking
+•	Compliance awareness — GDPR, banking data handling, regulatory examination expectations
+•	CI/CD integration — quality gates, automated rollback triggers, ArgoCD-based promotion gates
+•	Code quality — SonarQube or similar static analysis
+•	Kafka / Avro Schema Registry compatibility testing
+•	Basic Spark / Delta Lake to write integration tests against Delta tables and replay-from-time-travel scenarios
+NICE TO HAVE
+•	SWIFT message formats (MT103, MT202, MT700)
+•	Financial-services security frameworks (NIST, ISO 27001)
+•	SR 11-7 model risk management
+•	Red-team / adversarial testing
+•	OWASP ZAP, Snyk, HashiCorp Vault for secrets
+•	MLflow model-registry governance and lineage auditing
+
