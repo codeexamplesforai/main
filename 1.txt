@@ -1,0 +1,700 @@
+Hi Simone, Bhanu,
+Following our previous discussions, I've tried to define the parallel work streams below, each with its objective, expected outcome, and current status where available. These sit on top of the ongoing exercise of breaking the functional document into more granular modules and working through each of them.
+The goal is to reach our POC target in September. Many of these streams can run in parallel; some are dependent on others and may be blocked if a prerequisite stream isn't completed.
+1. Syndication with Compliance & Stakeholders
+Objective: Establish a weekly review cycle for the plans and documents we prepare. Each is first reviewed by representatives of the relevant teams (Compliance, etc.), then escalated to Marcel + Bhanu, and finally to Simone + Marco.
+Expected outcome: Agreement and sign-off on each functional module, its features, and the expected runtime output of the platform.
+2. App Registration & Infrastructure Setup
+Objective: Obtain the necessary registrations (e.g. Golden App) and set up the foundational ecosystem — code repos, Jira spaces, etc. — that will unblock code development and infrastructure procurement/setup.
+Expected outcome: A ready environment that allows development to begin.
+Current status: Pending Golden App registration. Potential blocker if it doesn't go through by Monday/Tuesday (1st week of June). We should check whether this can be expedited, as it gates the start of development.
+3. Feature Factory Code Re-org, New Repo & Temporary Data Layer
+Objective: Restructure the current Feature Factory code so it's consumable by the GAMMA platform for model features. Work with Sathya to agree on a temporary data layer to bridge us until the full data layer re-org.
+Expected outcome: A usable Feature Factory and an agreed temporary data layer.
+Note: The full data layer re-org is expected by Dec 2026; the temporary setup must suffice until then.
+4. Layer 2 — Model Layer Setup
+Objective: Set up the infrastructure to start coding and testing models, including the rule engine, for cases needing rules, ML models, or a hybrid approach.
+Expected outcome: An environment ready to support model development and testing.
+Dependency: Relies on Work Stream 2 — the ecosystem is needed to procure infrastructure and begin setup.
+5. Model Discussion Workshops & Finalisation
+Objective: Have the team identify the models required to cover the typologies for the CM Europe business line. The initial focus is to understand the major drivers of false positives in the current Actimize rules, then design models + rules that reduce/control them and optimise alert volume without affecting the true positive rate.
+Expected outcome: A first set of models and required features that address the FPs, with documentation.
+Current status: Analysis of the main reasons/buckets behind false positives (per rule/alert) is in progress. A preliminary analysis of required models is complete. Further workshops will be planned to finalise and document the models — this is the next step once the functional document has been broken into smaller modules.
+6. Typology-to-Rule Mapping for CM Europe
+Objective: Obtain the list of typologies to be covered in CM Europe along with the current rule mapping running under Actimize.
+Expected outcome: A complete typology-to-rule mapping.
+Current status: This mapping is not currently available and needs to be sourced.
+7. Data Layer Organisation for Model Training & Execution
+Objective: Organise the data layer to provide all the data and features needed to begin model testing.
+Expected outcome: Data and features available to initiate model testing.
+Dependency: Relies on Work Stream 3 — requires the agreed temporary data layer and the required-state Feature Factory to be in place.
+8. Tuning Matrix Structure & Setup
+Objective: Agree and finalise the structure of the tuning matrix — a crucial platform component — and set up the infrastructure to create, read, and edit it across the relevant logical layers of the platform.
+Expected outcome: An agreed tuning matrix structure with supporting infrastructure.
+9. Feedback Loop & Methodology
+Objective: Agree and finalise the feedback loop and its methodology so the supporting technical setup can be provisioned, even if not needed immediately.
+Expected outcome: An agreed methodology and provisioned technical support.
+10. Temporary Production Waiver
+Objective: Obtain the temporary waiver required to run/execute in production for the initial setups.
+Expected outcome: Approved waiver enabling early prod execution.
+11. LLM / Agentic AI Setup & Evaluation Planning
+Objective: Identify and secure access to the BNPP tools/platforms that enable LLM/Agentic AI usage in a production runtime, across the various GAMMA use cases and logical layers.
+Expected outcome: A viable, approved LLM/Agentic AI capability for the platform.
+Current status: Some potential BNPP setups have been identified and are being explored for suitability.
+12. Sprint Planning
+Objective: Run sprint planning for the identified functional modules to drive their technical implementation.
+Expected outcome: Planned sprints mapped to each functional module.
+13. Governance Cadence — Gov / Steer-Co / Op-Co
+Objective: Kick off regular Governance, Steer-Co, and Op-Co forums for tracking and sharing updates with the relevant audiences.
+Expected outcome: A running governance cadence with consistent reporting.
+Happy to walk through any of these in more detail or adjust priorities and sequencing where dependencies allow.
+
+
+
+
+
+
+
+Good — focusing on your actual rule inventory makes this much more concrete. Looking at the screenshot, you have 11 distinct rule families across OOB / Cloned / Custom Actimize models, with India-specific red flags appended. Let me first map your rules to the typology catalogue, then design ML models around the actual problem shapes.
+
+## Step 1 — Mapping your rules to the typologies from the catalogue
+
+| Your rule | What it does today | Typologies it serves |
+|---|---|---|
+| AML-EFC (Entity Focus Classification) | Risk-tiering customers by KYC score | RT#15, RT#18, foundation for all others |
+| AML-EXT (Entity Exemptions) | Whitelist filter | Operational — not a typology |
+| BNP-TSD (Transfers to/from High-Risk Destination) — LTH / THV / HRC / VRC variants | Geographic filter on destination country lists | RT#11 |
+| BNP-EFT (Excessive Funds Transfers) — EFT / CFT / CHK / CSH / DFT / SHT variants | Daily volume thresholds across instrument types | RT#21, RT#51, RT#63, RT#64 |
+| BNP-ADR (Activity Seen in Dormant Accounts) | Post-dormancy activity flag | RT#23 |
+| BNP-SPI (Suspicious Payment Instructions) — CTF / KEY / OBO variants | Keyword scan on payment message free text | RT#82, RT#33, partly RT#81 |
+| BNP-FTF (Flow Through Of Funds) | Pass-through ratio detection | RT#25, partly RT#41/42 |
+| BNP-EPC (Expected Profile Comparison) — INN / OUT variants | Activity vs. expected economic profile | RT#22, RT#52 |
+| BNP-NBI (New Account Becoming Inactive) | Newly opened account goes silent | RT#19 (related — account-farming pattern) |
+| BNP-STP (Structuring/Scattering) — SCT-INN / SCT-OUT / TRD-INN / TRD-OUT | Below-threshold aggregation | RT#26, RT#54 |
+| IRF (India Red Flag) | High-value inward/outward remittance, India-specific | RT#11 + RBI/FIU-India P2 reporting |
+
+These 11 rule families collapse cleanly into **7 ML models**, because several rules share the same underlying detection problem (you've just split them by instrument type or direction in Actimize).
+
+---
+
+## Model 1 — Customer Risk Score (replaces/augments AML-EFC; feeds every other model)
+
+**Rules covered:** AML-EFC (both A-039-CVA and P-039-CVA), AML-EXT
+**Typologies addressed:** RT#15, RT#18, foundation feature for RT#11-19 group
+
+**Why current rule generates FP:** AML-EFC produces a static high/medium/low tier based on KYC-time attributes. Once a customer is "High Focus" they stay there, and every subsequent rule fires harder on them — so 60-70% of all your downstream alerts probably trace back to this tier being too coarse. A high-tier customer doing routine activity still alerts. The whitelist (AML-EXT) is an over-correction: you've manually exempted enough customers that you're now blind on some of them.
+
+**Model architecture:**
+- Two-stage: a calibrated gradient-boosted classifier (LightGBM) predicting P(SAR within 12 months | customer attributes + 90-day behavior), with isotonic regression for probability calibration.
+- Output is a continuous risk score [0,1], not three tiers. Downstream rules consume the continuous score.
+
+**Input features:**
+- Static (KYC): country of residence/registration, sector (NACE), PEP status and category, beneficial-owner structure complexity (depth, jurisdictions), product holdings, relationship age, onboarding channel, sanctioned-country exposure flag.
+- Dynamic (behavioral, 30/90/180-day rolling): transaction volume and count vs. peer group, counterparty country mix, cash share, cross-border share, channel mix, dormancy stretches.
+- Network features (from entity resolution graph): degree, neighborhood average risk score, shared-attribute count with high-risk entities.
+
+**Training data:** historical AML-EFC tier assignments + SAR outcomes over the last 3-5 years. Crucially also include the AML-EXT exemption population as a control — many of these should NOT be exempt under a properly trained model.
+
+**Concrete example:**
+- *Current rule behavior:* A retail SME in textiles, tier-coded "High Focus" because the sector is sensitive. Every cross-border wire to suppliers in Bangladesh fires BNP-TSD-HRC. Last year: 47 alerts, 0 SARs.
+- *ML behavior:* Same customer, but the model sees that (a) all counterparties have been stable for 3+ years, (b) volume tracks reported turnover, (c) graph neighborhood is clean, (d) no inconsistency with KYC. Risk score 0.18. Downstream BNP-TSD no longer fires on this customer for routine activity. The model retains "high tier" only when behavior or network gives reason.
+
+**Expected impact:** 40-50% reduction in downstream alert volume across all rules, because BNP-EFT/TSD/EPC/STP all consume this as a feature. SAR conversion improves because alerts that survive are on genuinely riskier customers.
+
+---
+
+## Model 2 — High-Risk Jurisdiction Transaction Scorer (BNP-TSD + IRF)
+
+**Rules covered:** BNP-TSD (all 4 variants: LTH/THV/HRC/VRC), IRF (both India inward/outward variants)
+**Typologies addressed:** RT#11, RT#11 with India regulatory overlay
+
+**Why current rule generates FP:** Country-list rules are binary and contextless. They fire whenever country X is on list Y, regardless of customer purpose, history with that corridor, transaction characteristics, or counterparty risk. IRF compounds this with hard amount thresholds on remittances. Your 4 TSD variants exist because the country lists keep proliferating, which is itself a symptom of trying to add precision through configuration rather than learning.
+
+**Model architecture:**
+- Per-transaction XGBoost classifier with monotonic constraints on certain features (e.g., score must be monotonically increasing in country risk).
+- For IRF, add an India-specific head fine-tuned on India-resident transactions to respect P2 reporting nuance without over-firing.
+
+**Input features (per transaction):**
+- Transaction: amount, currency, channel, swift message type, MT103 field 70 free text length and content (NLP features from Model 5), correspondent bank, intermediary chain length.
+- Country: source/destination risk score (continuous, not list-based — derived from FATF, Basel AML Index, sanctions adjacency, tax-haven status, corridor-country status per your GFS referential).
+- Customer corridor history: count of prior transactions on this corridor (last 24m), volume share of this corridor in customer's activity, recency of last transaction, ratio of inbound vs outbound on this corridor.
+- Counterparty: prior occurrence count, counterparty risk score (if known), is counterparty on internal blacklist.
+- Customer context: Model 1 score, sector consistency with corridor (e.g., textile importer → Bangladesh = consistent), peer-group share of customers transacting on this corridor.
+
+**Worked example:**
+- *Current rule TP retention:* A new customer's first wire is €450k to a shell company in a corridor country, no prior corridor history, free-text says "consultancy fee," sector inconsistent. Both rule and model fire — keep this alert.
+- *Current rule FP eliminated:* A long-standing engineering firm sends its monthly €80k payment to a Russian subsidiary it has paid every month for 6 years; corridor history is dense, sector consistent. Rule fires (Russia on VRC list); model scores 0.09 and suppresses.
+- *Current rule miss added:* A customer makes a €15k payment to a counterparty in Cyprus (not a high-risk list country in your taxonomy), but the counterparty has been beneficially owned by a corridor-country entity flagged in the graph. Rule misses entirely; model catches via network features.
+
+**India IRF specific:** the model learns that NRI remittances from Gulf states above ₹10 lakh are routine for certain customer segments and should not fire P2 in those cases, while flagging the same amount from a salaried domestic customer with no NRI relatives — which the current threshold-only rule cannot distinguish.
+
+**Expected impact:** 50-65% FP reduction on BNP-TSD; 40-55% on IRF (lower because of regulatory reporting floor that you cannot suppress regardless of model opinion).
+
+---
+
+## Model 3 — Behavioral Anomaly Detector (BNP-EFT all 6 variants + BNP-EPC both variants)
+
+**Rules covered:** BNP-EFT (EFT, CFT, CHK, CSH, DFT, SHT — all the "Excessive Daily Incoming Fund Transfers" siblings), BNP-EPC (INN and OUT)
+**Typologies addressed:** RT#21, RT#22, RT#51, RT#52, RT#63, RT#64
+
+**Why current rule generates FP:** This is your biggest FP source almost certainly. The 6 BNP-EFT variants are the same rule applied to 6 instrument types — a maintenance nightmare and statistically problematic because thresholds are tuned independently. BNP-EPC then layers a profile comparison on top, often double-alerting on the same transactions. Both rules use static thresholds or simple averages, so any customer with naturally bursty business (payroll dates, quarterly tax, end-of-month invoicing) lights up every cycle.
+
+**Model architecture:**
+- A single multi-task deep anomaly model serving all 8 rule variants. Architecture: an autoencoder over a tokenized transaction sequence, plus a head that compares the customer's current-window embedding against their own historical centroid AND against their peer-group centroid (this gives you the "historical" axis for BNP-EFT and the "expected profile" axis for BNP-EPC in one shot).
+- Output: 2 scores per customer per day — historical anomaly score and peer anomaly score. Either can trigger; combination of both is a stronger signal.
+
+**Input features:**
+- Sequence input: transaction events for last 365 days, tokenized as (amount_bucket, instrument_type, direction, channel, country, MCC/sector, hour, day_of_week, counterparty_repeat_indicator).
+- Aggregated features per rolling window (1d, 7d, 30d, 90d): count and value by instrument (covering all 6 EFT variants natively), incoming/outgoing ratio, cross-border share, counterparty entropy, cash-denomination mix.
+- Profile baseline: KYC-stated turnover, expected monthly volume range, declared sectors, headcount-implied volume range.
+- Peer comparison: percentile position of current behavior within HDBSCAN-derived peer cluster.
+- Calendar features: known payroll/tax/seasonal indicators inferred from customer's own history.
+
+**Worked example:**
+- *Current rule FP eliminated:* A €200M-turnover manufacturer files quarterly VAT in March, June, September, December — each time a €4.8M outgoing wire hits BNP-EFT-EFT and BNP-EPC-OUT. Currently: 8 alerts/year, all closed as no-action. Model recognizes the quarterly cadence in the customer's own 3-year history (high autocorrelation at 90-day lag), scores it 0.08, suppresses both.
+- *Current rule FP eliminated:* A retail merchant deposits €15-25k cash every Monday. BNP-EFT-CSH fires weekly. Model recognizes the periodicity and the consistency with declared sector (cash-intensive business), suppresses unless amount breaks pattern.
+- *Current rule miss added:* A small consulting LLC with stated €500k turnover suddenly receives €380k in 11 incoming wires over 10 days, then sends it onward in 14 outgoing wires. No single day hits the BNP-EFT daily threshold (€50k say). Model catches the aggregate-week anomaly + the rapid in-out pattern.
+- *Current rule miss added:* A customer reduces transaction volume dramatically while suddenly using check instruments they've never used before. Volume rule doesn't fire (numbers are within threshold), but the channel-switch is a strong signal — model catches the embedding shift.
+
+**Expected impact:** This is where the biggest absolute FP reduction lives. Realistic target: 55-70% FP reduction across the 8 BNP-EFT/EPC variants combined, with SAR conversion improving from typical 2-4% to 8-12% on surviving alerts. Also retires 6 separate rule configurations down to 1 model, eliminating the maintenance overhead.
+
+---
+
+## Model 4 — Account Lifecycle Anomaly Model (BNP-ADR + BNP-NBI)
+
+**Rules covered:** BNP-ADR (Activity Seen In A Dormant Account, both A-M07-AIN and P-M07-AIN), BNP-NBI (New Account Becoming Inactive)
+**Typologies addressed:** RT#23, RT#19 (account-farming variant)
+
+**Why current rule generates FP:** Dormancy rules trigger on the binary "was inactive for X days, now active" event. They cannot distinguish a customer who left funds parked during maternity leave from an account being weaponized. BNP-NBI is even noisier — many newly opened accounts go inactive for benign reasons (customer chose a different primary bank, account opened for a future purpose).
+
+**Model architecture:**
+- Survival analysis model (Cox proportional hazards or a neural survival model like DeepSurv) modeling the probability of "abnormal post-dormancy behavior" given dormancy length, customer features, and initial reactivation transaction characteristics.
+- BNP-NBI handled by a separate light classifier on first-90-days-of-life features predicting "account-farming likelihood."
+
+**Input features:**
+- Dormancy context: dormancy length, prior activity pattern before dormancy, balance during dormancy, products held.
+- Reactivation transaction: amount relative to historical, counterparty country, counterparty newness, channel (in-branch vs. digital), originator if incoming.
+- Customer state: did KYC change during dormancy? Address change? New beneficial owners? Power-of-attorney changes during dormancy? (These are the highest-signal features and your current rule cannot consume them.)
+- For BNP-NBI: account-opening channel, customer profile completeness, initial funding source, days from opening to first transaction, presence of a single small "test" transaction.
+
+**Worked example:**
+- *Current rule FP eliminated:* A salaried customer's account stays dormant 14 months while she's on overseas assignment. On return, salary credit resumes and a wire transfer pays a domestic mortgage. BNP-ADR fires. Model sees no KYC change, no counterparty change, consistent with prior pattern — score 0.05, suppress.
+- *Current rule TP retained + enriched:* An account dormant 18 months suddenly receives a €95k incoming wire from a corridor country, immediately followed by ATM withdrawals in a third country. POA was added 30 days before reactivation. Rule fires; model scores 0.94 and adds the POA-change signal to the alert narrative for L2.
+- *BNP-NBI specific:* Account opened, single €50 funding wire, then silent for 4 months — currently fires NBI. Model checks: customer is a student who opened the account ahead of a job that starts later. Low score. Versus: account opened by an entity with limited KYC depth, immediately funded €20k, then silent — high score.
+
+**Expected impact:** 45-60% FP reduction on BNP-ADR. BNP-NBI is harder to evaluate because the typology mapping is fuzzy (RT#19 only partial overlap) — expect 30-45% FP reduction, and likely you'll find some BNP-NBI alerts should escalate to RT#19 enhanced scrutiny rather than just close.
+
+---
+
+## Model 5 — Payment Message NLP Classifier (BNP-SPI all variants)
+
+**Rules covered:** BNP-SPI-EFT-MSG-A-S01-CTF, BNP-SPI-EFT-MSG-A-S01-KEY, BNP-SPI-EFT-MSG-A-S01-OBO
+**Typologies addressed:** RT#82 (terrorism financing key words), RT#33 (suspicious information from client), partial RT#81
+
+**Why current rule generates FP:** Keyword scanning is the canonical FP machine. "Donation" in a payment to a registered charity is benign; the same word in a wire to an unregistered organization in a sensitive country is not. Current keyword lists also miss obfuscated language (transliteration variants, coded terms) and produce constant noise on legitimate uses like "loan" or "help" between family members.
+
+**Model architecture:**
+- Multilingual transformer (XLM-RoBERTa base, fine-tuned) doing 3-class classification: benign / suspicious-context / high-confidence-terrorism-related. Multilingual is critical because your TRACFIN keyword list per the catalogue is partly French, and free text in MT103 field 70 in your EM and Fortis flows arrives in many languages.
+- A second head extracts named entities (organizations, persons, locations) for matching against sanctions/watch lists with context-aware confidence.
+
+**Input features:**
+- Tokenized payment message free text (fields 70, 72 in MT103; remittance information in pain.001).
+- Contextual features fed alongside the text: destination country risk, recipient sector, customer profile, amount band, prior occurrence of similar text from this customer, Model 1 risk score.
+
+**Training labels:** historical BNP-SPI alerts with dispositions; SARs filed with text excerpts; published TRACFIN/FIU radicalization keyword lists for high-confidence positive examples. Augment with synthetically obfuscated variants (transliterations, spacing tricks).
+
+**Worked example:**
+- *Current rule FP eliminated:* "Loan repayment to brother" on a €500 wire from a salaried customer to a sibling in the same country. Keyword "loan" triggers. Model reads the full context — domestic, small, family — score 0.03.
+- *Current rule TP retained:* "Help for the brothers" on a €2,800 wire to an unregistered organization in a corridor country. Both rule and model fire — keep.
+- *Current rule miss added:* "Project support — refer offline" on a series of small wires to multiple recipients in different jurisdictions. No keyword hits in current list, but the model picks up the evasive/coded pattern combined with the fan-out structure.
+- *OBO (On Behalf Of) variant:* "On behalf of [name]" where the named party doesn't match any KYC record and appears in multiple unrelated payments — model flags as potential third-party-control signal feeding into Model 7.
+
+**Expected impact:** 60-75% FP reduction on BNP-SPI variants. This is one of the highest-impact wins because keyword rules generate disproportionate alert volume. Net SAR detection often *improves* because the model catches coded language the keyword list misses.
+
+---
+
+## Model 6 — Flow-Through / Pass-Through Detection (BNP-FTF)
+
+**Rules covered:** BNP-FTF-TRN-ALL-A-B02-FTR (Flow Through of Funds)
+**Typologies addressed:** RT#25 (rapid movement), partial RT#41/RT#42
+
+**Why current rule generates FP:** Pass-through ratio rules (in-to-out within X days) fire on any low-net, high-gross account — which describes legitimate operating accounts, treasury accounts, cash management accounts, and escrow/trustee accounts. Without distinguishing the *structure* of the pass-through, the rule cannot tell a corporate sweep account from a layering account.
+
+**Model architecture:**
+- Two-component: (a) graph-feature engineering producing pass-through signature features, (b) gradient-boosted classifier trained on SAR labels.
+- Optional advanced: GraphSAGE on the transaction graph for cases where graph topology carries the signal.
+
+**Input features:**
+- Pass-through metrics: gross-to-net ratio (rolling 7d, 30d), median holding time (credit-to-debit lag), in-out volume correlation coefficient, balance volatility.
+- Counterparty structure: in-degree (distinct originators), out-degree (distinct beneficiaries), in-out counterparty overlap (low overlap = layering signal; high overlap = legitimate operations), counterparty country diversity, fan-pattern shape (one-to-many, many-to-one, many-to-many).
+- Counterparty risk: average risk score of originators and beneficiaries, graph distance to known high-risk nodes.
+- Customer context: declared business purpose, expected operational model (does customer's KYC indicate this account *should* be a pass-through, e.g., escrow services), Model 1 score.
+
+**Worked example:**
+- *Current rule FP eliminated:* A logistics company's operating account with €15M gross monthly turnover and €200k net change. Rule fires monthly. Model sees the same 50 counterparties repeating, all consistent with declared shipping customers, all in low-risk countries — score 0.04.
+- *Current rule TP retained + enriched:* An individual's account receives €8k from 12 distinct originators in country A over 5 days, sends €92k to 3 beneficiaries in country B over the next 3 days. Zero counterparty overlap, customer is a salaried employee with no business KYC. Model 0.91, escalate, and add originator/beneficiary graph cluster to alert.
+- *Current rule miss added:* A more sophisticated layering pattern using 4 customer accounts of related individuals where each individual account stays just below the FTF ratio threshold, but the graph view shows the 4 accounts function as a single pass-through unit. Graph features catch what single-account features cannot.
+
+**Expected impact:** 50-65% FP reduction on BNP-FTF. Net new detection rate 8-12% from graph-level catches.
+
+---
+
+## Model 7 — Structuring & Scattering Detector (BNP-STP all 4 variants)
+
+**Rules covered:** BNP-STP-EFT-INN-A-DXX-SCT, BNP-STP-EFT-INN-A-DXX-TRD, BNP-STP-EFT-OUT-A-DXX-SCT, BNP-STP-EFT-OUT-A-DXX-TRD
+**Typologies addressed:** RT#26 (structuring), RT#54 (cash structuring — if you extend to cash channel)
+
+**Why current rule generates FP:** Already noted in the spreadsheet that these are custom Actimize-template models fed from external detection — meaning you've already partially externalized this. The current external detection is presumably pattern-matching on just-below-threshold density. It will catch obvious cases but generate FP on legitimate behaviors that happen to cluster near round numbers (e.g., €9,500 sales receipts), and miss structuring that uses non-obvious value distributions.
+
+**Model architecture:**
+- 1D-CNN or small transformer over windowed transaction sequences, specifically tuned for the structuring signature. Outputs a probability that the window contains a structuring pattern, with the rationale (just-below-threshold density, sequential numbering of instruments, low amount variance, counterparty pattern).
+- Since you already feed external detection results to UDM, this fits your existing architecture — just upgrades the external detector.
+
+**Input features:**
+- Window-level (rolling 7d, 14d, 30d on a per-customer-per-direction basis): count of transactions in [threshold-X%, threshold] bracket, ratio of bracket-count to total-count, density above/below the threshold line, amount standard deviation within window (low SD with high count = structuring signal), Benford's law deviation on first digits.
+- Sequence features: instrument sequential-numbering pattern (for cash structuring with sequential cashier's checks per RT#54 description), time intervals between transactions, time-of-day clustering.
+- Counterparty features: counterparty count, counterparty repeat pattern (same beneficiary across multiple just-below transactions is stronger signal than dispersed).
+- Customer context: legitimate reasons that produce near-threshold clustering (cash-intensive retail with daily ~€9k deposits is a peer pattern, not structuring) — peer-group baseline rate of bracket activity.
+- For TRD (Trade?) variants: trade-related contextual features (linked LC, linked invoice).
+
+**Worked example:**
+- *Current rule TP retained:* Customer makes 11 cash deposits of €9,400-€9,800 over 9 days, all at different branches, same beneficiary on same-day onward wires. Rule fires, model scores 0.96 — keep, and add inter-branch pattern to alert narrative.
+- *Current rule FP eliminated:* A jewelry retailer makes daily €8-10k cash deposits as part of normal trading. Falls in the structuring band but peer comparison shows other jewelry retailers do this; customer's own 18-month history shows it's their stable baseline; no onward fan-out — score 0.07, suppress.
+- *Current rule miss added:* A customer structures using deliberately *uneven* amounts (€7,847; €8,210; €6,930…) that avoid the obvious near-threshold band but still aggregate to a large total below the customer's profile expectation. Density rule misses; Benford + low-SD + aggregation features catch.
+- *Current rule miss added (RT#54 specific):* Customer purchases sequential cashier's checks numbered 4082, 4083, 4084 in amounts under reporting threshold. Sequential numbering + matching denomination is a strong RT#54 signal currently invisible to your rule.
+
+**Expected impact:** 45-60% FP reduction; 5-10% net new detection from the non-obvious distribution cases and the sequential-instrument cases.
+
+---
+
+## Cross-cutting recommendations
+
+A few notes that apply across the seven models:
+
+**Actimize integration:** since several of your rules (BNP-STP) already feed external detection into UDM via the Actimize template pattern, your team already knows how to externalize ML scoring into SAM. Use that same pattern for all 7 models — each model writes a score per customer-per-day-per-typology back into UDM, and the existing Actimize rule fires only when the score crosses a calibrated threshold. This means you keep your Actimize rule layer (regulators like it), but starve it of FP at the source.
+
+**Whitelist (AML-EXT) — kill it gradually:** the static exemption list is probably hiding some real risk. Replace it with a dynamic suppression list driven by Model 1 — customers below a calibrated score threshold are auto-suppressed for the relevant downstream rules, with the suppression decision logged and periodically audited. This gives you the FP reduction the whitelist provides without the regulatory exposure of permanent exemptions.
+
+**Sequencing:** I'd build in this order. (1) Model 1 first because it's a feature for everything else and gives the biggest cross-cutting FP reduction. (2) Model 3 next because it covers 8 of your rule variants and gives the largest single-model impact. (3) Model 7 because the externalization pattern already exists. (4) Model 5 because NLP wins are quick and visible. (5) Models 2, 4, 6 in parallel after that.
+
+**India IRF caveat:** P2 reporting to FIU-India has a statutory floor that you cannot suppress via ML. Use the model to *prioritize* IRF alerts and add context for the FIU narrative, not to suppress the reporting itself. This needs explicit sign-off from your India compliance team and probably a separate model governance review.
+
+**Realistic combined impact across the 11 rules:** 50-60% total alert volume reduction in steady state (year 2 post-deployment), SAR conversion improving from current (industry baseline) levels to roughly 3x, and 8-12% net new detections that pure rules would miss — mostly from Models 5, 6, and 7 where context and graph features add genuinely new capability.
+
+Want me to go deeper on any one of these — say, the actual feature engineering pipeline for Model 3, or a model risk management template you can take to model validation?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Good call — here's the typology explanation woven into each of the 7 models. I'll keep it focused on *what the typology is* and *what we're actually checking for*, since you have the model design from the prior message.
+
+---
+
+## Model 1 — Customer Risk Score (AML-EFC, AML-EXT)
+
+**RT#15 — Transactions involving High Risk Clients**
+- *What it is:* Customers classified as high-risk under KYC scoring — typically due to complex ownership structures, adverse media history, regulatory red flags, sensitive nationality/residency, or high-risk product holdings.
+- *What we're checking for:* Whether a customer's overall KYC-derived risk warrants applying enhanced monitoring thresholds and reduced tolerance for unexplained activity. This is foundational risk-tiering, not transaction-level detection.
+
+**RT#18 — Transactions involving Politically Exposed Persons (PEP)**
+- *What it is:* Current/former senior public officials, their close associates, and immediate family members. PEPs carry heightened corruption and bribery risk because their position gives them means and motive to misuse public office for private gain.
+- *What we're checking for:* Whether transactions are consistent with the PEP's declared sources of wealth and income, or whether patterns suggest illicit proceeds — large unexplained inflows, high-value asset purchases (real estate, jewelry), payments via trust structures, rapid asset value changes inconsistent with market movements.
+
+---
+
+## Model 2 — High-Risk Jurisdiction Transaction Scorer (BNP-TSD, IRF)
+
+**RT#11 — Transactions to or from high-risk jurisdictions**
+- *What it is:* Cross-border transactions touching countries with elevated ML/TF risk. The catalogue defines three categories: (a) "high sensitive" / "very high sensitive" countries per the Group's country-sensitivity classification, (b) tax havens per the Group's tax-haven referential, and (c) "corridor countries" facilitating sanctions/embargo circumvention — particularly in the Russia/Ukraine context.
+- *What we're checking for:* Whether money is moving to or from a jurisdiction that poses elevated risk because of sanctions exposure, weak AML/CTF regimes, tax-haven characteristics, or sanctions-evasion corridor status. Also whether a customer with no prior corridor history suddenly begins transacting on a high-risk corridor, which is itself a red flag even if the volume is modest.
+
+**RT#11 — India regulatory overlay (IRF)**
+- *What it is:* India FIU's P2 reporting requirement on high-value cross-border remittances, both inward and outward.
+- *What we're checking for:* Statutory thresholds on remittance value, with prioritization of cases that combine high value with anomalous profile signals (e.g., salaried domestic customer with no NRI relatives sending high-value outward remittances).
+
+---
+
+## Model 3 — Behavioral Anomaly Detector (BNP-EFT all variants, BNP-EPC)
+
+**RT#21 — Unusual transactional activity (compared with historical behaviour)**
+- *What it is:* A significant deviation in a customer's transactional pattern vs. their own established historical baseline. The baseline is computed from average activity over a defined comparison period; the deviation can be in value, volume, transaction-type mix, counterparty mix, or timing.
+- *What we're checking for:* Has this customer's behavior shifted materially from what they've done before? Includes (a) volume/value spikes, (b) shifts in transaction-type breakdown (e.g., from mostly domestic wires to mostly cross-border), (c) significant changes in established counterparty relationships, and (d) "suspicious timing" — large transactions made just before reporting period ends, suggesting the customer wants to obscure the transaction.
+
+**RT#22 — Unusual transactional activity (compared with the client's economic profile)**
+- *What it is:* Activity that doesn't match what we'd expect from this customer based on KYC information (declared turnover, profession, sector) and/or peer-group behavior. The economic profile is built either dynamically (from comparable peer behavior) or statically (from KYC data).
+- *What we're checking for:* Does the activity make economic sense for this customer? An unemployed customer receiving large transfers; a "student" or "truck driver" transferring large values to bullion accounts; a corporate receiving volumes inconsistent with declared turnover or with the number of employees declared.
+
+**RT#51 — Unusual cash activity (compared with historical or stated behaviour)**
+- *What it is:* Cash deposit or withdrawal levels significantly different from the customer's historical pattern, either deviation from average behavior or single large transactions breaking pattern.
+- *What we're checking for:* Sudden spikes in cash deposits/withdrawals, cash activity in geographically unexpected locations (deposits in cities where the customer doesn't live/work), large cash transactions just before reporting period ends.
+
+**RT#63 — Unusual use of checks (compared with historical or stated behaviour)**
+- *What it is:* Check-related activity deviating significantly from the customer's baseline check usage. Includes Remote Deposit Capture patterns which can be exploited for layering.
+- *What we're checking for:* Customers making large frequent cash deposits but checks drawn to individuals/firms not normally associated with their retail business; receiving large numbers of third-party checks endorsed in favor; check volume from gambling winnings.
+
+**RT#64 — Unusual use of cash equivalent instruments**
+- *What it is:* Anomalous use of bearer instruments like money orders, traveller's checks, and cashier's checks — instruments where the bearer is presumed to be the owner, creating anonymity in value transfer.
+- *What we're checking for:* Patterns where customers acquire cash equivalents from multiple banks/MSBs, use them for insurance premiums or annuity payments, or chain instrument purchases (cash → cashier's check → another instrument) to obscure source.
+
+---
+
+## Model 4 — Account Lifecycle Anomaly Model (BNP-ADR, BNP-NBI)
+
+**RT#23 — Reactivation of dormant accounts**
+- *What it is:* Accounts that have been inactive over an extended period suddenly becoming significantly active. The typology applies only to account types where dormancy is unusual (e.g., a current account that's meant to be the customer's primary banking relationship). Dormancy definition varies by jurisdiction.
+- *What we're checking for:* Why is this account active again? Specifically: requests to reactivate dormant accounts from abroad, dormant accounts suddenly receiving rapid and large fund movements before going silent again (a "burst" pattern indicating account-rental for layering), and dormancy reactivation in a different sector than the original account purpose.
+
+**RT#19 — Recently established entities & entities with a recent change in company purpose** (related to BNP-NBI)
+- *What it is:* Detection of transactions involving entities that are newly on-boarded (so we have no historical baseline) and entities that have recently pivoted their stated business purpose. A quick change in company purpose may itself be indicative of illicit intent — e.g., a company changing purpose during an economic shock and immediately conducting risky activity.
+- *What we're checking for:* Newly created companies carrying out risky investment activity with very large cash flows and outflows to foreign countries; reactivation of dormant companies in a different sector than originally registered; recently incorporated entities transacting with high-risk jurisdictions or counterparties before any normal business activity has developed.
+
+---
+
+## Model 5 — Payment Message NLP Classifier (BNP-SPI all variants)
+
+**RT#82 — Transactions involving terrorism financing related Key Words**
+- *What it is:* Use of the Group's CTF Enhanced Monitoring Key Words referential to detect potential terrorism-financing signals in payment-message free text. The referential combines public open-source intelligence with internal terrorism-case insights, and includes language-specific subsets (e.g., a French-language subset).
+- *What we're checking for:* Presence of trigger key words *in context* — credit transfers from abroad disbursed in cash or transferred onward to third parties with explicit motivation language ("donation," "loan," "help"), wires with religious or political content in the free-wording section that doesn't match the customer's profile, and patterns where the same coded language appears across multiple unrelated payments.
+
+**RT#33 — Suspicious behaviour related to information provided by the client** (partial overlap on the OBO variant)
+- *What it is:* Clients who are evasive, reluctant, or inconsistent when providing information to justify a transaction, including providing false/corrupted documentation. This covers in-transaction information (payment narratives, supporting documentation provided on request) — not KYC onboarding information, which is covered elsewhere.
+- *What we're checking for:* Vague or contradictory payment justifications, invoices from companies whose described services don't match the payment context, customers reluctant to provide supporting documentation when requested, high personal-expense justifications ("mission fees" disproportionate to declared role), and inconsistencies between purchase orders, invoices, and market prices for the same goods.
+
+**RT#81 — Weak signals of radicalization related to the client** (partial — Model 5 contributes signals, full RT#81 detection requires Model 4 + 5 combined plus customer-level features)
+- *What it is:* TF detection often cannot rely on single strong signals; instead, multiple weak signals must be accumulated across the customer's information, behavior, and products. Examples: large cash withdrawal immediately after receiving social-security benefit, donations to sensitive cultural/religious organizations, transactions for the benefit of armories, requests to reactivate accounts from abroad.
+- *What we're checking for:* Accumulation of weak indicators that, individually, wouldn't justify a SAR but in combination raise terrorism-financing suspicion warranting enhanced investigation.
+
+---
+
+## Model 6 — Flow-Through / Pass-Through Detection (BNP-FTF)
+
+**RT#25 — Rapid movement of funds**
+- *What it is:* Accounts associated with rapid movement of debit and credit transactions within a specified analysis period. Often manifests as "cash in, wire out" within a short timeframe — the account is being used as a transit channel rather than for storing value. The typology emphasizes that enhanced scrutiny is needed especially when the corresponding countries are on high-sensitivity lists.
+- *What we're checking for:* High transactional velocity uncharacteristic of the customer (sum of credits divided by average balance over the analysis period yields a high pass-through ratio); large amount transferred internationally then withdrawn very quickly; same amounts credited and debited net of fees (transit nature); short median holding time of funds.
+
+**RT#41 — Many-to-one activity** (partial overlap when fan-in pattern dominates)
+- *What it is:* A high number of distinct originator counterparties depositing funds into a single account, which are then withdrawn or wired to another account. Often referred to as "funnel," "pooled," "omnibus," or "concentration" accounts.
+- *What we're checking for:* Significant numbers of counterparties with no obvious relationship to the receiving account; concentration patterns indicating the account is collecting illicit proceeds from multiple sources; wire transfers by several individuals to the same beneficiary in another country (a classic smurfing-of-migrants signal).
+
+**RT#42 — One-to-many activity** (partial overlap when fan-out pattern dominates)
+- *What it is:* A high number of distinct beneficiaries receiving funds from a single account — the inverse of RT#41. Particular attention to individual accounts behaving like corporate accounts, which can be evidence of Hawala-like remittance schemes.
+- *What we're checking for:* Single accounts dispersing funds to many unrelated parties; division of funds into cheques and/or smaller cash transactions to pay merchandise; multiple payments to a party group from the same party group within a short period; transactions effected in bursts of activity.
+
+---
+
+## Model 7 — Structuring & Scattering Detector (BNP-STP all variants)
+
+**RT#26 — Structuring**
+- *What it is:* Repeated debit or credit transactions with single values below a common reporting threshold that aggregate to a significant total — a deliberate attempt to avoid currency-threshold reporting limits set by regulators or by internal Group/BL procedures. Extended to also cover sequential financial instruments (e.g., a series of checks) used to break up a large transfer into smaller, less detectable pieces.
+- *What we're checking for:* Customer's transactions consistently sitting just below applicable thresholds; disbursement of loan proceeds via multiple checks each under threshold; numerous wire transfers each under the remitting-country reporting requirement; clusters of sequential instruments with low amount-variance suggesting coordinated split.
+
+**RT#54 — Cash structuring**
+- *What it is:* Cash-specific version of RT#26 — repeated cash deposits or withdrawals just below the cash-reporting threshold, often called "smurfing" when conducted across multiple accounts or branches.
+- *What we're checking for:* Multiple cash deposits below threshold (e.g., under $1,000 in jurisdictions where that's the structuring signal) made several times per month; splitting large currency deposits across several accounts; deposits in multiple cities/branches followed by ATM withdrawals in foreign countries; sequential cashier's-check purchases.
+
+---
+
+A note on what's left out of your current rule set worth flagging: your 11 rules cover the high-volume detection cases well, but the typology catalogue includes several risks your rules don't currently address — notably **RT#43 (multiple entities sharing information)**, **RT#45 (account controlled by a third party)**, **RT#14 (trusts and opaque legal structures)**, the **Trade Finance group (RT#711-715)**, and **Correspondent Banking (RT#731-733)**. These typically need dedicated ML approaches (graph analysis for RT#43/45, document NLP for trade finance) and aren't easily retrofitted into your existing Actimize rule families. If any of those are coverage gaps you're aware of, worth raising with compliance separately — the ML build for them is a different conversation than tuning your existing 11.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Two good questions. Let me take them in order.
+
+---
+
+## Part 1 — Which models need an LLM layer on top, and where it actually adds value
+
+Not all models benefit equally. LLMs help where the problem is fundamentally about *interpreting language, context, or policy in ways traditional ML can't template*. They're expensive, slow, and add explainability complexity, so use them surgically. Here's the ranking with concrete examples.
+
+### Tier 1 — Strong case for LLM augmentation
+
+**Model 5 (Payment Message NLP) — LLM value: very high**
+
+This is fundamentally a language task, so the LLM is doing what it's best at. The XLM-RoBERTa classifier I described earlier handles bulk classification cheaply, but ambiguous cases need contextual reasoning the classifier can't do. Use a two-stage design: classifier for high-confidence cases, LLM for the grey zone.
+
+*Example where LLM disambiguates correctly:*
+
+Payment narrative reads: *"for the brothers project — phase 2 milestone"*
+
+Classifier-only behavior: "brothers" is on the radicalization keyword list (it's a common in-group reference in extremist communication). Confidence 0.62, alert.
+
+LLM-augmented behavior: the LLM is given the narrative plus the customer's KYC profile (partner in "Brothers Construction LLP"), the counterparty (registered architecture firm in the same city), the prior 6 months of payments to the same counterparty matching invoice patterns, and the customer's industry. The LLM produces: *"Narrative refers to the customer's own LLP name. Counterparty and amount are consistent with the established invoice pattern. No radicalization context."* Score adjusted to 0.08, suppress.
+
+*Reverse example where LLM escalates:*
+
+Payment narrative: *"for school fees"* — a benign phrase a keyword classifier wouldn't flag.
+
+LLM sees: customer has no children declared in KYC, recipient is an unregistered entity in a conflict-zone jurisdiction, customer made 7 similar "school fees" payments in the last month to 7 different recipients in the same country, recent KYC change added a new address in that country. The LLM produces a SAR-grade narrative: *"Repeated small payments framed as education expenses to unrelated entities in [country] without family or sponsorship context. Pattern resembles funding dispersal under benign-sounding cover."* Escalate to L2 with the LLM narrative attached.
+
+This single use case typically delivers 20-30% additional FP reduction *on top of* what the classifier alone achieves, plus 5-8% net new detections from coded/euphemistic language the keyword list misses.
+
+**Model 4 (Account Lifecycle / Dormancy) — LLM value: high**
+
+Dormancy reactivation is highly context-dependent. The structural anomaly model can score the pattern, but *why* the account was dormant and *why* it's active again is usually written in CRM notes, branch interaction logs, KYC update history, and customer correspondence — unstructured data the survival model can't consume.
+
+*Example:*
+
+Dormant account (14 months) suddenly receives a €95k incoming wire from a corridor country, then makes ATM withdrawals in a third country.
+
+Model 4 score: 0.82 (high — alert).
+
+LLM reads the adjacent data: CRM note from 8 weeks ago says *"Customer's father (resident in [corridor country]) passed away — discussed inheritance documentation requirements."* Property sale documentation was uploaded to KYC 4 weeks ago. ATM withdrawals are in the country where the customer's daughter is studying (declared dependent in KYC).
+
+LLM output: *"Reactivation context is documented inheritance. Counterparty country matches deceased family member's residence per CRM. Outflow geography matches declared dependent's location."* Score adjusted to 0.15, suppress with full context logged.
+
+Without the LLM, this becomes a 4-hour L2 investigation that closes as no-action. With the LLM, it auto-suppresses with a full audit trail.
+
+### Tier 2 — Moderate case for LLM augmentation
+
+**Model 1 (Customer Risk Score) — LLM value: high, but in a specific role**
+
+Don't use LLM as the scoring model — gradient boosting is faster, cheaper, more explainable, and easier to validate. Use the LLM as an *input feature generator* for two things:
+
+(a) **Adverse media ingestion.** LLM reads news articles and regulatory filings, extracts mentioned entities, classifies severity (investigation / charge / conviction / civil matter / mere mention), maps jurisdictions, and dates the event. Output is a structured feature vector that feeds into the gradient-boosted classifier.
+
+*Example:* News article in Portuguese reports *"Diretor da Construtora X é indiciado por lavagem de dinheiro em operação da PF."* LLM extracts: entity = Director of Construtora X, event = money laundering charge, jurisdiction = Brazil federal, recency = 3 days. If your customer's beneficial owner matches "Diretor da Construtora X" (via entity resolution), Model 1's risk score lifts from 0.34 to 0.78 within 24 hours of the news breaking — versus the typical 3-6 month KYC refresh cycle.
+
+(b) **KYC narrative interpretation.** Many KYC systems store free-text justifications, source-of-wealth explanations, and onboarding notes that the structured score ignores. LLM reads these, extracts risk-relevant entities and claims, and flags inconsistencies between narrative and structured data.
+
+**Model 6 (Flow-Through) — LLM value: moderate**
+
+The structural detection is best done by the graph model. LLM adds value in interpreting *why* the pass-through exists — reading the narrative text across all transactions in the chain to determine business purpose.
+
+*Example:* Model 6 flags a customer with pass-through ratio 0.96. LLM reads narratives across the chain: all incoming wires labeled *"payroll advance"* from a single corporate, all outgoing wires labeled *"salary - [employee name]"* with matching distribution pattern. Customer KYC confirms registered payroll service provider. LLM contextualizes and suppresses with narrative justifying the suppression decision.
+
+### Tier 3 — Limited case for LLM augmentation (use sparingly)
+
+**Model 3 (Behavioral Anomaly)** — LLM helps mainly with *explanation generation* for L2, not detection. The statistical model knows volume spiked; the LLM reads adjacent context (recent KYC update, recent news about the customer's industry, recent merger announcements) and writes the explanation. Useful but not critical.
+
+**Model 2 (Jurisdiction)** — mostly list-based. LLM useful only for reading payment narratives that might explain a high-risk-corridor transaction (alimony to ex-spouse with court order reference, humanitarian remittance with documented charity, etc.).
+
+**Model 7 (Structuring)** — pure statistical pattern. LLM adds almost nothing because the signal is in the numbers, not the language.
+
+### Cross-cutting LLM use case worth building separately
+
+Regardless of which model triggered, an LLM that **generates the SAR narrative for L2 analysts** is one of the highest-ROI builds in the whole stack. Given the alert payload (transactions, customer context, model scores, feature attributions), it drafts a structured SAR-ready narrative covering: factual summary, suspicious elements, regulatory typology mapping, supporting evidence references. L2 analysts edit rather than write from scratch. Typical throughput improvement: 30-50% per investigator. This is a shared service across all 7 models.
+
+---
+
+## Part 2 — Whitelisting, blacklisting, and conditional checks in ML
+
+Yes, absolutely — and you should. ML alone without these controls is regulatorily uncomfortable and operationally fragile. The trick is to do it in a way that doesn't break the model's calibration. Here are the techniques, in order of how I'd actually use them.
+
+### Technique 1 — Hard policy layer (pre- and post-ML)
+
+The simplest pattern, and the one regulators most expect to see. ML scoring sits between two deterministic rule layers:
+
+```
+Transaction → PRE-ML POLICY (mandatory triggers/exclusions)
+              ↓
+              ML MODEL (probability score)
+              ↓
+              POST-ML POLICY (overrides + conditional checks)
+              ↓
+              Final Action
+```
+
+**Pre-ML examples:**
+- Sanctioned-country transactions always alert, regardless of ML score (mandatory reporting).
+- Customers under active SAR-related review always escalate, ML score doesn't suppress.
+- Transactions above a regulatory threshold (e.g., FIU-India P2 floor) always file the report.
+
+**Post-ML examples:**
+- If ML score > 0.7 AND customer is on internal high-attention list → escalate to L2 directly, skip L1.
+- If ML score < 0.2 AND customer is on dynamic whitelist → auto-close.
+- If country in [Russia, Iran, North Korea adjacents] → escalate regardless of ML score below 0.5.
+
+This is the "always check" mechanism the user is asking about. It's deterministic, auditable, and easy to validate.
+
+### Technique 2 — Conditional feature enrichment ("if country X, also check Y, Z")
+
+This directly answers the user's question. Architecture:
+
+```
+Transaction comes in
+    ↓
+Feature Engineering Pipeline (base features always computed)
+    ↓
+Conditional Enrichment Layer:
+    if country in HIGH_RISK_CORRIDORS:
+        compute additional features:
+            - counterparty parent-company sanctions adjacency
+            - intermediary bank chain length
+            - dual-use goods classification (if trade)
+            - beneficial owner residency
+            - payment narrative entity match
+    if customer KYC country in FATF_GREY_LIST:
+        compute additional features:
+            - source-of-wealth document age
+            - UBO complexity score
+            - days since last KYC refresh
+    ↓
+ML Model (consumes ALL features including conditional ones)
+```
+
+The ML model is *always trained with the full feature set* — features that don't apply for a given transaction are simply zero or missing-flagged. The model learns to weight them appropriately for the contexts where they're populated.
+
+*Worked example — Russia corridor case:*
+
+Standard transaction features: amount, currency, date, channel, counterparty country, customer KYC score, counterparty repeat-count, etc.
+
+When the country flag triggers (counterparty country = Russia corridor), the pipeline additionally computes:
+
+1. *Counterparty parent-company sanctions adjacency* — does the counterparty have a beneficial owner or parent entity within 2 hops of an EU/US/UK sanctions list?
+2. *Intermediary bank chain analysis* — count of intermediaries, presence of any intermediary in a sanctions-adjacent jurisdiction.
+3. *Goods/services dual-use risk* — if trade transaction, LLM-extracted goods description scored against EU dual-use catalogue.
+4. *Beneficial owner residency consistency* — is the UBO declared as resident in a sanctioned jurisdiction now flagged as Russia-corridor?
+
+These four features feed into Model 2's gradient-boosted classifier alongside everything else. The model learns from training data that, conditional on a Russia-corridor flag, these four features carry high predictive weight. For non-Russia corridor transactions they're effectively unused.
+
+You can configure this with a simple YAML/JSON policy file that compliance owns:
+
+```yaml
+corridor_rules:
+  russia_corridor:
+    trigger_countries: [RU, BY, "corridor_list_v3"]
+    additional_features:
+      - counterparty_sanctions_proximity
+      - intermediary_chain_jurisdictions
+      - dual_use_goods_score
+      - ubo_residency_consistency
+    minimum_review_tier: L2
+    
+fatf_grey_list:
+  trigger_countries: ["fatf_grey_v4"]
+  additional_features:
+    - kyc_refresh_days
+    - source_of_wealth_doc_age
+    - ubo_complexity
+```
+
+This gives compliance direct control over "if country X, also check Y, Z" without requiring code changes or model retraining for policy updates.
+
+### Technique 3 — Monotonic constraints
+
+Used inside the ML model itself. LightGBM and XGBoost support constraints that force the model's output to move in a specified direction with respect to certain features. For AML, you typically want:
+
+- Risk score must *increase* monotonically with country risk rating.
+- Risk score must *increase* monotonically with KYC risk tier.
+- Risk score must *increase* monotonically with PEP status.
+
+This prevents the model from learning counter-intuitive patterns from biased training data (e.g., "high-risk-country transactions are usually closed as no-action, so let's score them lower"). It also helps with regulatory explainability — you can prove the model never reduces risk for higher-risk inputs.
+
+### Technique 4 — Whitelist and blacklist as calibrated adjustments (not exemptions)
+
+The instinct is to build a whitelist that exempts customers from monitoring entirely. Don't. That's how blind spots form, and that's likely what your current AML-EXT rule is creating. Instead, use whitelists as *score adjustments* with audit and time limits.
+
+Architecture:
+
+```
+Whitelist effect: ML score is multiplied by 0.5 (or similar), with floor of e.g. 0.15
+Blacklist effect: ML score is multiplied by 1.5 (or boosted), with ceiling enforcement
+
+All whitelist/blacklist entries:
+- Have an explicit business justification logged
+- Have a fixed expiry date (e.g., 6 or 12 months)
+- Require periodic review and recertification
+- Cannot suppress a score above a critical threshold (e.g., 0.8 always alerts regardless)
+- Cannot apply to sanctions-related triggers
+```
+
+This gives you the operational benefit of a whitelist (known-good customers don't generate noise) without the regulatory risk (no permanent blind spots, full audit trail, mandatory recertification, override floor for high-confidence detections).
+
+### Technique 5 — Country-specific sub-models (mixture-of-experts)
+
+For your largest corridors with sufficient training data, you can train country-specific sub-models that get invoked when those countries appear. A "Russia corridor expert," "India remittance expert," "China trade expert" sub-model each learns the patterns specific to that corridor better than a single global model could.
+
+This is heavier engineering — only worth it if (a) you have meaningful SAR training data per corridor and (b) the corridor volume justifies it. For most banks, only 3-5 corridors clear that bar. I'd not lead with this — Techniques 1, 2, 3 cover 80% of what you need.
+
+---
+
+## How these fit together — the practical architecture
+
+For your existing Actimize-based system, the integration looks like this:
+
+```
+Actimize SAM (rule firing layer — kept as-is for regulatory comfort)
+        ↑
+        | (score + threshold gates rule)
+        |
+External Detection Service (your UDM-fed pattern, already exists)
+        ↑
+        |
+ML Scoring Service
+  ├── Pre-ML Policy Layer (sanctions, mandatory reporting, exclusions)
+  ├── Feature Pipeline
+  │     └── Conditional Enrichment (country-aware, segment-aware)
+  ├── ML Model (with monotonic constraints)
+  ├── LLM Augmentation (for Tier 1 models: 5, 4; selective on others)
+  ├── Post-ML Policy Layer (overrides, conditional checks, escalation rules)
+  └── Whitelist/Blacklist Adjustments (calibrated, audited, expiry-bound)
+        ↓
+   Calibrated final score → UDM → Actimize rule fires/doesn't fire
+```
+
+The compliance team owns the policy layers and the conditional-enrichment YAML. The data science team owns the ML model and LLM augmentation. The model risk team validates calibration of the combined output. This separation of concerns is what regulators actually want to see during inspections — not a black-box AI making AML decisions, but a clearly governed system where compliance controls the policy and AI improves the precision.
+
+One thing worth flagging if you go this route: the conditional feature enrichment, the policy layers, and the whitelist/blacklist adjustments all need to be *versioned and auditable* — every alert decision should be reproducible six months later, including which policy version applied. Build the version-pinning into the pipeline from day one. Retrofitting it later is painful.
+
+Want me to sketch the actual schema for the policy/conditional YAML, or walk through how the calibration validation would work for a regulator review?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
