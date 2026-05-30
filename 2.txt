@@ -1,0 +1,619 @@
+You're right — those one-line architectures are useless for actually building this. Let me go deep on each, including the actual feature computations, training data construction, scoring math, and step-by-step walk-throughs of how each model processes the example cases.
+
+I'll keep the same 7 models in the same order so you can cross-reference back to the FP/TP examples from earlier.
+
+---
+
+# Model 1 — Customer Risk Score (replacing AML-EFC, augmenting AML-EXT)
+
+## Architecture in detail
+
+A calibrated gradient-boosted classifier with three feature families fused into a single score per customer per day. Four components:
+
+**Component A — Feature pipeline.** Runs nightly, computes ~90 features per customer across three groups (static KYC, dynamic behavioral, network/graph). Outputs a single feature row per customer per day, persisted to a feature store.
+
+**Component B — LightGBM classifier.** ~500 boosted decision trees, depth 6, learning rate 0.05, with `scale_pos_weight` set to inverse class frequency (SARs are ~0.3% of population so weight ≈ 330). Binary classification target: "did this customer have a SAR filed in the following 12 months?" Monotonic constraints applied to specific features (described below) so the score must move in the correct direction with respect to known risk drivers.
+
+**Component C — Isotonic calibration.** The raw LightGBM probability is rank-correct but not calibrated. A monotonic isotonic regression is fit on a held-out validation set to convert raw scores into actual P(SAR | features). This matters because downstream rules will gate on numeric thresholds — without calibration, "0.6 means alert" isn't meaningful.
+
+**Component D — Tier mapper (configurable).** Continuous score is sliced into tiers for human consumption: [0.00–0.15] low, [0.15–0.40] medium, [0.40–0.70] elevated, [0.70+] high. The slicing thresholds are set by compliance, not by the data scientist.
+
+## Feature engineering
+
+**Static KYC (~30 features).** Country of residence and registration (target-encoded: each country mapped to its historical SAR rate in training data, so "DE" might encode to 0.002 and "MT" to 0.018). NACE sector at levels 2 and 4, target-encoded. PEP status (5 levels: none/domestic/foreign/family/associate, ordinal encoded). UBO ownership depth and jurisdiction entropy (Shannon entropy of UBO countries — single domestic UBO = 0, complex multi-jurisdiction = high). Product holdings as counts. Relationship age in months. Onboarding channel. Sanctioned-country exposure flag.
+
+**Dynamic behavioral (~40 features).** All computed in rolling 30, 90, 180-day windows: transaction count and value (split by instrument: wire/cash/check/card/security), incoming vs outgoing split, cross-border share, cash share, channel mix, largest single transaction, distinct counterparty count, counterparty country entropy, dormancy occurrence in each of the last 4 quarters, velocity ratio (gross flow ÷ average balance).
+
+**Network/graph (~20 features).** Computed from the entity-resolution graph: degree (in + out), neighborhood average risk score (mean of immediate neighbors' Model 1 scores from previous day — yes, recursive), shared-attribute count with high-risk entities (same address, phone, beneficial owner), BFS distance to nearest SAR-filed entity, Louvain community ID and community average risk.
+
+## Monotonic constraints
+
+Applied to: country risk encoding (score can only increase with higher country risk), PEP status (only increase with stronger PEP exposure), UBO complexity (only increase with greater complexity), neighborhood risk (only increase). This prevents the model from learning counter-intuitive patterns from biased training data and gives you a defensible answer for the model validator question "could this model ever reduce risk for a higher-risk input?"
+
+## Training
+
+Label: binary, "SAR filed for this customer within 12 months of the feature snapshot date." Training set: 3 years of daily feature snapshots × all customers, joined to SAR events. ~50M training rows for a Tier-1 bank, ~150k positives.
+
+Temporal split: train on snapshots from years 1-2, validate on first 6 months of year 3, test on second 6 months of year 3. Never random k-fold — leakage is brutal in AML data because SAR-filed customers have correlated feature histories.
+
+Class imbalance: address via `scale_pos_weight` in LightGBM AND focal loss (γ=2). SHAP values computed per prediction at inference for explainability.
+
+## Worked example — the textile importer
+
+Mumbai SME, NACE 4641 (wholesale textiles), registered 2018, turnover €4.2M, single domestic UBO, no PEP, opened via branch.
+
+Feature snapshot (selected values shown):
+
+| Feature | Value | Notes |
+|---|---|---|
+| country_residence_te | 0.012 | India target encoding |
+| nace_l4_te | 0.018 | Textile wholesale |
+| relationship_age_months | 73 | |
+| pep_status_ord | 0 | |
+| ubo_jurisdiction_entropy | 0.0 | Single domestic UBO |
+| volume_in_90d | 1,300,000 | |
+| volume_out_90d | 1,100,000 | |
+| counterparty_country_entropy_90d | 1.42 | 4 countries |
+| cash_share_90d | 0.02 | Almost no cash |
+| distinct_counterparty_90d | 14 | Stable supplier base |
+| counterparty_repeat_rate_90d | 0.71 | 71% of counterparties seen >1× |
+| graph_degree | 18 | |
+| graph_neighbor_avg_risk | 0.31 | Mid-range neighborhood |
+| graph_sar_distance | 4+ | No SARs within 4 hops |
+
+LightGBM aggregates the 500 trees. Most trees push the score down (stable relationship, repeat counterparties, low cash, no SAR proximity, no PEP). A few push slightly up (textile sector encoded above mean, Bangladesh-corridor counterparties). Raw output: 0.31. Isotonic calibration maps 0.31 → 0.18. Tier: medium.
+
+**Critical:** this 0.18 is then a feature input to Models 2, 3, 6, 7. Under the current AML-EFC rule, this customer would have been tagged "High Focus: Risk Level" purely on the static "textile + Bangladesh corridor" combination, and every downstream rule would have fired harder on them. Model 1 sees the same risk inputs but factors in 5 years of clean behavior, repeat counterparty pattern, clean graph neighborhood, and produces a continuous, contextually-informed score that downstream rules consume as evidence.
+
+---
+
+# Model 2 — High-Risk Jurisdiction Transaction Scorer (BNP-TSD + IRF)
+
+## Architecture in detail
+
+Per-transaction inference (not per-customer like Model 1). Three components:
+
+**Component A — Conditional feature enrichment pipeline.** Base features computed for every transaction. Conditional features computed only when specific country flags fire (Russia corridor, FATF grey list, etc.) — this is the "if country X, also check Y, Z" mechanism from the previous answer.
+
+**Component B — XGBoost with monotonic constraints and dual heads.** Standard XGBoost regressor (~300 trees, depth 5), but with two output heads in a multi-task setup: Head A produces score for general BNP-TSD scenarios, Head B produces score specifically calibrated for the India IRF P2 reporting flow. Shared trunk learns common features, heads specialize. Monotonic constraints on country_risk_score (positive), customer_model1_score (positive), and amount above €10k (positive).
+
+**Component C — Pre/post-ML policy layer.** Sanctioned country pairs always alert regardless of model score. P2 statutory thresholds always file the regulatory report regardless of model. Whitelist adjustments applied as score multipliers, not exemptions.
+
+## Feature engineering — base (always computed)
+
+**Transaction-level.** Amount (log-transformed for distribution-handling). Currency (one-hot for top 12 + "other"). Channel (SWIFT, SEPA, RTGS, ACH, internal). Message type. Free-text NLP features pulled from Model 5: text length, named-entity count, suspicious-keyword score. Correspondent bank ID and risk score. Intermediary chain length (number of hops).
+
+**Geographic.** Source and destination country risk scores — these are continuous values, not list memberships. Each country's score is a weighted blend of: FATF mutual evaluation ratings, Basel AML Index, sanctions-adjacency (BFS distance to nearest sanctioned country in geopolitical graph), tax-haven score, corridor flag. Corridor pair frequency: how often this exact source-destination pair appears across BNPP global volume in the last 90 days — rare pairs flag.
+
+**Corridor history (customer-specific).** Customer's prior transactions on this corridor in last 24 months. Customer's volume share of this corridor (this corridor's volume ÷ total customer volume). Recency in days since last corridor transaction. Inbound/outbound ratio on this corridor.
+
+**Counterparty.** Prior occurrence count with this customer. Counterparty Model 1 risk score if BNPP customer; external risk proxy otherwise. Counterparty internal blacklist flag. Counterparty entity-resolution match confidence (low confidence = name might be obscured).
+
+**Customer context.** Model 1 score. Sector-corridor consistency flag (computed from a precomputed sector-corridor matrix: textile importer + Bangladesh = expected combination, score = 1; doctor + Bangladesh corridor = unexpected, score = 0).
+
+## Feature engineering — conditional (activated on country flag)
+
+When `corridor_flag_russia` fires, four additional features computed:
+- `counterparty_sanctions_proximity` — BFS distance in beneficial-ownership graph to nearest EU/US/UK sanctioned entity
+- `intermediary_chain_jurisdictions` — count of intermediary banks in sanctions-adjacent jurisdictions
+- `dual_use_goods_score` — if trade transaction, Model 5/LLM extracts goods description and scores against EU dual-use catalogue
+- `ubo_residency_consistency` — does declared UBO residency align with current high-risk-jurisdiction flag
+
+When `fatf_grey_flag` fires, three additional features:
+- `kyc_refresh_days`
+- `source_of_wealth_doc_age`
+- `ubo_complexity_recheck`
+
+These features are zero/missing-flagged when not activated, so the model handles them gracefully.
+
+## Worked example — the textile importer's routine €78k wire
+
+Customer: same Mumbai textile SME, Model 1 score 0.18. Wires €78,000 to long-standing Dhaka supplier. SWIFT MT103, narrative is invoice reference.
+
+| Feature | Value |
+|---|---|
+| amount_log | 11.26 |
+| dst_country_risk | 0.42 (Bangladesh, FATF grey) |
+| corridor_flag_HRC | 1 |
+| prior_corridor_txns_24m | 36 |
+| corridor_volume_share | 0.62 |
+| corridor_recency_days | 11 |
+| counterparty_prior_count | 28 |
+| counterparty_blacklist | 0 |
+| customer_model1_score | 0.18 |
+| sector_corridor_consistency | 1 |
+| peer_corridor_rate | 0.74 |
+| free_text_suspicious_score | 0.04 |
+| ubo_residency_consistency | 1 (conditional — fired due to FATF flag, customer UBO in India = consistent) |
+
+XGBoost trees process — I'll show 3 representative splits:
+- Tree path 1: `prior_corridor_txns_24m > 10` → `sector_corridor_consistency = 1` → leaf value −0.08
+- Tree path 2: `customer_model1_score < 0.25` → leaf value −0.06
+- Tree path 3: `dst_country_risk > 0.35` → `corridor_volume_share > 0.4` → leaf value −0.03 (high volume share with consistent corridor is *de-risking* because it suggests durable trade relationship, not anomalous spike)
+
+Sum of all 300 tree contributions: raw score 0.12. Calibrated: 0.09. Threshold for alert: 0.35. **Result: suppressed.**
+
+The current BNP-TSD-HRC rule would have alerted on this purely because Bangladesh is on the HRC list and the amount is meaningful. The model knows that "Bangladesh + textile importer + 36 prior corridor transactions + clean behavioral profile" is the *expected* behavior, not the suspicious one.
+
+## Worked example — new customer's first €450k wire to Bangladesh shell
+
+Same destination country, very different context.
+
+| Feature | Value |
+|---|---|
+| amount_log | 13.02 |
+| dst_country_risk | 0.42 |
+| corridor_flag_HRC | 1 |
+| prior_corridor_txns_24m | 0 |
+| corridor_volume_share | 1.00 (this is their entire history) |
+| counterparty_prior_count | 0 |
+| customer_model1_score | 0.58 (new customer, shell-like UBO depth) |
+| sector_corridor_consistency | 0 (declared sector inconsistent) |
+| free_text_suspicious_score | 0.31 ("consultancy fee" is vague) |
+| amount_to_profile_ratio | 8.2 |
+
+Tree contributions trend the opposite direction. Raw score: 0.79. Calibrated: 0.81. **Alert, escalate to L2 with feature attributions shown.**
+
+## How IRF case is handled differently
+
+Same model, Head B activates for India-resident customers. The remittance threshold from RBI is encoded as a regulatory floor in the post-ML policy layer: if amount ≥ ₹X, the P2 report is filed regardless of model score (statutory). But the *alert prioritization* uses the model score to decide whether the report needs investigator review or auto-files with minimal narrative. NRI customers receiving monthly Gulf remittances get score 0.10 → auto-file P2 with template narrative. Salaried domestic customer suddenly sending high-value outward remittance → score 0.74 → P2 filed + L2 investigation triggered.
+
+---
+
+# Model 3 — Behavioral Anomaly Detector (replaces all 6 BNP-EFT + both BNP-EPC)
+
+This is the most architecturally involved. I'll detail it carefully because it's also where the biggest FP reduction lives.
+
+## Architecture in detail
+
+Five components, end-to-end:
+
+**Component A — Transaction tokenizer.** Each transaction in the customer's history is converted into a discrete token by binning its attributes:
+- amount → 16 log-spaced buckets (€1–10, €10–100, €100–1k, …, €10M+)
+- instrument → 8 types (wire, cash, check, card, securities, FX, prepaid, other)
+- direction → 2 (in, out)
+- channel → 8
+- counterparty country → top-50 codes + "other"
+- MCC/sector → top-100 + "other"
+- hour bucket → 4 (business hours / evening / night / weekend)
+- counterparty repeat indicator → 3 (first-time / occasional / frequent)
+
+Each tuple is a token; the cardinality of the token vocabulary is bounded (~50k unique combinations actually observed). Each token gets a learned 128-dim embedding.
+
+**Component B — Transformer encoder.** Small but capable: 6 layers, hidden dim 128, 4 attention heads, ~5M parameters total. Input: customer's last 1024 transaction tokens (or fewer, padded). Position encoded via a hybrid of absolute position embedding + relative time embedding (time deltas between transactions in days). Output: a 128-dim contextualized vector per token.
+
+**Component C — Self-supervised pretraining.** Done once across the entire customer population (~10M customer sequences). Standard masked-token-prediction objective: randomly mask 15% of tokens, train the model to predict them. This teaches the transformer the "grammar" of normal transactional behavior across all customer segments — it learns that wire-out-EUR-to-DE typically follows wire-in-EUR-from-DE for export businesses, that cash deposits cluster on certain days for retail, and so on. ~2 weeks on a single A100 for 10M sequences, 10 epochs. This is a fixed-cost training that's reused.
+
+**Component D — Anomaly scoring.** Three distinct anomaly signals computed per customer per day:
+
+1. **Historical own-baseline anomaly.** Take the customer's tokens from day t-30 to t, average-pool the encoder outputs to get embedding `e_now` (128-dim). Take tokens from day t-365 to t-90 (the deeper historical window), average-pool to get `e_hist`. Score = 1 − cosine_similarity(e_now, e_hist). Range [0, 2], typically [0, 0.5] in practice.
+
+2. **Peer-baseline anomaly.** Get the customer's peer cluster from the HDBSCAN clustering (Foundational Layer 3). Compute the centroid `e_peer` of all peer members' current embeddings. Score = 1 − cosine_similarity(e_now, e_peer).
+
+3. **Sequence reconstruction error.** Pass `e_now` through a learned decoder that tries to reconstruct the actual last-30-day token sequence. MSE between reconstruction and reality. Captures pattern anomalies that pure embedding-distance might miss.
+
+**Component E — Supervised head.** A small logistic regression takes the three anomaly scores plus a handful of raw features (amount-to-90-day-average ratio, cash-share change, counterparty-country-entropy change, customer Model 1 score) and produces the final calibrated probability. Trained on (anomaly scores → SAR label) using historical alert dispositions. This step is what makes the model regulator-friendly — the final decision is a transparent logistic regression on interpretable inputs.
+
+## Per-rule routing
+
+The 8 rule variants (6 EFT + 2 EPC) share this architecture but use different masking/filtering in Component D:
+
+| Original rule | Masking applied in scoring |
+|---|---|
+| BNP-EFT-EFT | Filter sequence to wire transactions only before pooling |
+| BNP-EFT-CFT | Filter to credit funds transfers |
+| BNP-EFT-CHK | Filter to checks |
+| BNP-EFT-CSH | Filter to cash transactions |
+| BNP-EFT-DFT | Filter to drafts |
+| BNP-EFT-SHT | Filter to the specific transaction type SHT codes |
+| BNP-EPC-INN | Use peer anomaly as primary signal, incoming-only masking |
+| BNP-EPC-OUT | Use peer anomaly as primary signal, outgoing-only masking |
+
+One model, eight inference paths, eight separately-calibrated thresholds. This collapses six maintenance-heavy rule families into one model.
+
+## Worked example — the quarterly VAT payer (the FP we want to kill)
+
+€200M-turnover manufacturer. Behavior over 365 days: ~350 transactions/month, dominant pattern is mid-cycle wires to suppliers in 4 countries + monthly payroll + quarterly large outflow on/near 15th of March/June/September/December (this is the VAT filing).
+
+March 15, 2026: €4.8M outgoing wire to tax authority. Current rules: BNP-EFT-EFT fires (daily threshold exceeded) and BNP-EPC-OUT fires (profile threshold exceeded). Two alerts.
+
+Model 3 processing:
+1. Tokenize last 365 days (4,200 transactions → 4,200 tokens, truncated to last 1024).
+2. Encoder produces contextualized vectors. Average-pool last 30 days → `e_now`.
+3. Average-pool day -365 to -90 → `e_hist`. *Critically, this window includes the December 15 VAT payment from the prior year and partly the September one.* The transformer's positional encoding plus the recurring pattern in the token stream means the model has already seen this exact pattern.
+4. cosine_similarity(e_now, e_hist) = 0.94. Historical anomaly = 0.06.
+5. Peer cluster = "EUR €100M–€500M turnover manufacturers". Their current embeddings show the same March VAT spike. cosine_similarity(e_now, e_peer) = 0.88. Peer anomaly = 0.12.
+6. Reconstruction: decoder reconstructs the recent token sequence accurately because the quarterly pattern is highly predictable. MSE = 0.04.
+7. Supervised head inputs: [hist_anom=0.06, peer_anom=0.12, recon_err=0.04, amt_to_90d_avg=0.39, cash_share_change=0.0, ctpty_entropy_change=0.01, model1_score=0.22]
+8. Logistic regression output: 0.08 calibrated probability.
+9. BNP-EFT-EFT threshold = 0.42 → **suppressed**. BNP-EPC-OUT threshold = 0.40 → **suppressed**.
+
+Two FP alerts eliminated.
+
+## Worked example — the small consulting LLC (the TP we want to catch that rules currently miss)
+
+Small consulting LLC, declared turnover €500k, historical pattern: 2-3 outgoing wires per month under €15k each, occasional small incoming receipts.
+
+Day 0–10: receives 11 incoming wires totaling €380k from disparate counterparties in two countries; no single day breaks any individual transaction threshold (€50k say). Days 11–14: sends out 14 wires totaling €372k to 3 beneficiaries.
+
+Model 3 processing:
+1. Tokenize last 365 days. Historical pattern: ~30 tokens total over the year, all small.
+2. `e_now` (last 30 days) encodes a fundamentally different pattern — many large-amount-bucket tokens, multiple counterparty countries, dense temporal clustering.
+3. `e_hist` (prior 9 months) encodes the old sparse small-wire pattern.
+4. cosine_similarity(e_now, e_hist) = 0.29. Historical anomaly = 0.71.
+5. Peer cluster of similar declared consulting LLCs has e_peer reflecting their normal sparse pattern. cosine_similarity(e_now, e_peer) = 0.32. Peer anomaly = 0.68.
+6. Reconstruction: decoder, trained on the sparse pattern, can't reconstruct the burst. MSE = 0.39.
+7. Supervised head inputs: [hist=0.71, peer=0.68, recon=0.39, amt_to_90d_avg=18.4, cash_change=0.0, ctpty_entropy_change=2.1, model1_score=0.34]
+8. Logistic regression output: 0.86.
+9. **Alert generated on BNP-EFT-EFT (wire mask, score 0.86), BNP-EPC-INN (incoming peer anomaly, score 0.83), and BNP-EPC-OUT (outgoing, 0.78).**
+
+Three appropriate alerts on a pattern that the current daily-threshold rule completely misses because no single day breaks the threshold. Model 3 catches the *aggregate-and-velocity* signal.
+
+## Worked example — channel switch with stable volume
+
+Customer reduces wire volume slightly while suddenly using checks they've never used before. Volume on each instrument stays within thresholds; daily-threshold rules don't fire.
+
+Model 3: `e_now` contains check tokens that have never appeared in `e_hist`. The embedding distance picks this up because the token vocabulary distribution shifted. Historical anomaly = 0.34, peer anomaly = 0.41. Final score: 0.52. Alert on BNP-EFT-CHK with explanation "customer using checks for first time in 365 days — channel shift". Rules-based system would never have surfaced this.
+
+---
+
+# Model 4 — Account Lifecycle Anomaly (BNP-ADR + BNP-NBI)
+
+## Architecture in detail
+
+Two distinct sub-models because the two rules detect opposite ends of the account lifecycle, but they share infrastructure:
+
+**Sub-model A (BNP-ADR — dormancy reactivation).** DeepSurv neural-network survival model. Predicts the hazard function over time — P(account exhibits abnormal post-reactivation behavior by time t given features observed at reactivation).
+- Input layer: 60-dim feature vector
+- Three hidden layers: 256 → 128 → 64, ReLU activations, dropout 0.3
+- Cox proportional hazards output layer with negative log partial likelihood loss
+- Output: hazard score, convertible to P(SAR within 6 months)
+
+**Sub-model B (BNP-NBI — new account becoming inactive).** Lighter LightGBM classifier on first-90-days-of-life features.
+
+## Feature engineering — Sub-model A
+
+**Dormancy-period features.** Length of dormancy in days. Average and max balance during dormancy (a dormant account holding €5 is different from one holding €50k). Pre-dormancy activity pattern (last 12 months of activity before going dormant). Products held during dormancy.
+
+**Reactivation transaction features.** Amount of reactivating transaction. Amount as ratio to pre-dormancy average transaction (key feature). Counterparty country and country risk. Counterparty first-time flag. Channel (in-branch is different from digital is different from correspondent).
+
+**KYC-change-during-dormancy features (highest predictive value).** Whether KYC was refreshed during dormancy. Address change. Beneficial owner change. **Power of attorney added** — this is often the strongest single signal for fraudulent reactivation. Phone number change. Email change. Days from KYC change to reactivation.
+
+**Customer state.** Model 1 score now. Model 1 score at start of dormancy. Change in score during dormancy.
+
+**LLM-augmented features (optional but high-value).** CRM_note_context_score from LLM reading CRM notes around the dormancy/reactivation period for legitimate explanation (illness, overseas, inheritance, retirement). Customer correspondence sentiment.
+
+## Training
+
+Labels: dormancy-reactivation events from past 3 years where a SAR was filed within 6 months post-reactivation = event, no SAR within 6 months = censored. ~12k events for a Tier-1 bank, ~400 SAR-labeled.
+
+DeepSurv is well-suited here because survival analysis is the right statistical framework for "did something abnormal happen by time t" questions, and the neural network lets the model learn nonlinear interactions between dormancy length, KYC changes, and reactivation context.
+
+## Worked example — the overseas-assignment salaried customer (FP elimination)
+
+Salaried customer, account dormant 14 months while on overseas assignment. Returns; salary credit resumes from same employer; pays domestic mortgage.
+
+Feature vector:
+- dormancy_length_days = 425
+- balance_during_dormancy_avg = €8,400 (consistent, suggests passive funds)
+- amount_reactivation = €4,200 (the salary credit)
+- amount_to_prior_avg_ratio = 1.05 (matches pre-dormancy salary pattern)
+- counterparty_country_risk = 0.04 (domestic)
+- counterparty_first_time_flag = 0 (same employer payroll ID as before dormancy)
+- kyc_refresh_during_dormancy = 1
+- address_change = 1 (temporary overseas address noted)
+- ubo_change = 0
+- poa_added = 0
+- model1_score_current = 0.14
+- crm_note_context_score = 0.85 (LLM read note: "Customer on 18-month overseas assignment, returns March 2026")
+
+DeepSurv forward pass: hidden layers compress the 60-dim input to a 64-dim representation, Cox layer outputs hazard = 0.06. Six-month survival probability = e^(-0.06) ≈ 0.94, so P(abnormal within 6 months) = 0.06. Calibrated to P(SAR) = 0.04. BNP-ADR threshold = 0.35. **Suppressed.**
+
+## Worked example — the suspicious €95k reactivation (TP enrichment)
+
+Account dormant 18 months. Receives €95k incoming wire from corridor country. POA was added 30 days before this reactivation. Outbound ATM withdrawals follow in a third country (the customer's daughter's study country, per KYC).
+
+Feature vector:
+- dormancy_length_days = 540
+- amount_reactivation = 95,000
+- amount_to_prior_avg_ratio = 22.6
+- counterparty_country_risk = 0.78
+- counterparty_first_time_flag = 1
+- kyc_refresh_during_dormancy = 0
+- poa_added = 1
+- days_from_poa_to_reactivation = 30
+- model1_score_current = 0.41
+- crm_note_context_score = 0.12 (no documented explanation)
+
+DeepSurv hazard = 0.92. P(SAR) calibrated to 0.89. **Alert, escalate to L2 directly (skip L1) because score > 0.85, with feature attribution highlighting `poa_added` and `counterparty_country_risk` as top contributors.**
+
+## Sub-model B for BNP-NBI
+
+Lighter LightGBM on first-90-days features: account opening channel, KYC completeness score, initial funding source, initial funding amount, days from opening to first transaction, presence of a "test" small transaction pattern, first-transaction counterparty risk.
+
+Example FP elimination: student opens account 4 months before starting first job; small initial €50 deposit; silent for 4 months. Current NBI fires. Model sees: KYC completeness 0.95, opening channel = branch, declared profession = student, declared expected first-activity date in onboarding form falls in current month. Score 0.06, suppress.
+
+Example TP catch: account opened with shallow KYC, immediately funded €20k from unfamiliar source, silent 4 months. Score 0.78, alert as potential account-farming pattern (RT#19 enhanced scrutiny).
+
+---
+
+# Model 5 — Payment Message NLP Classifier (BNP-SPI all variants)
+
+## Architecture in detail
+
+Five components forming a cascade:
+
+**Component A — XLM-RoBERTa base model.** 270M parameters, multilingual (100+ languages, critical for your EM and Fortis flows where free text arrives in many languages). Off-the-shelf checkpoint, then domain-adapted.
+
+**Component B — Domain adaptation pretraining.** Continued masked-language-model pretraining on 5M payment messages from BNPP's own historical flow (anonymized). This teaches the model BNPP-specific patterns, abbreviations, and corridor-specific phrasings. ~3 days on 4 GPUs.
+
+**Component C — Fine-tuned classification head + entity extraction head.** Multi-task: 3-class softmax (benign / suspicious-context / high-confidence-TF) and token-level NER (BIO tagging for ORG/PER/LOC/AMOUNT/DATE/PROJECT). Fine-tuned on labeled examples (described below).
+
+**Component D — Context fusion MLP.** Takes the [CLS] embedding from RoBERTa (768-dim) plus structured context features (destination country risk, amount band, customer Model 1 score, counterparty repeat flag, customer business name tokens, declared sector, etc.) and produces a final fused score.
+
+**Component E — LLM escalation for uncertain cases.** If fused score is in the uncertainty band [0.30, 0.70], the full context is packaged and sent to an LLM (e.g., a 70B-class model or commercial frontier model) for nuanced reasoning. LLM returns: final classification, structured reasoning, suggested SAR-narrative draft if escalating.
+
+## Training data construction
+
+Three classes:
+- **High-confidence-TF (~2k examples).** SAR-filed transactions with TF typology, augmented with public TRACFIN/FIU radicalization keyword examples, augmented with synthetic obfuscation variants (transliteration, character substitution, deliberate misspelling — e.g., "br0thers", "brоthers" with Cyrillic 'о').
+- **Suspicious-context (~30k examples).** SAR-filed transactions with non-TF typology (general money laundering, fraud).
+- **Benign (~5M examples).** Random sample of closed-alert and never-alerted transactions.
+
+Heavy class imbalance handled via class-weighted cross-entropy plus oversampling minority classes during fine-tuning.
+
+## Worked example — "for the brothers project — phase 2 milestone" (FP elimination)
+
+Tokenization: subword tokens split as ["for", "the", "brothers", "project", "—", "phase", "2", "milestone"].
+
+Forward pass through XLM-RoBERTa:
+- Attention layers focus heavily on "brothers" because in fine-tuning, this token co-occurred with TF-labeled examples
+- [CLS] embedding emerges with high "suspicious" axis loading
+- Classification head: P(benign)=0.32, P(suspicious)=0.58, P(TF)=0.10
+
+If we stopped here, this would alert.
+
+Context fusion MLP sees additional features:
+- customer_business_name_contains("brothers") = 1 (KYC name is "Brothers Construction LLP")
+- counterparty_repeat_count = 14
+- amount_matches_invoice_pattern = 1 (€4,200 matches prior invoice cadence)
+- counterparty_country_risk = 0.06
+- model1_score = 0.18
+- declared_sector = construction
+- crm_recent_contact = positive engagement, recent
+
+MLP fuses [768-dim CLS + 32-dim structured context] → 256 hidden → 1 output. Fused output: 0.09.
+
+Below uncertainty band [0.30, 0.70], no LLM escalation needed. **Suppressed.**
+
+## Worked example — "for school fees" pattern (TP new detection)
+
+Single transaction: "for school fees", €600, to recipient in conflict-zone country.
+
+RoBERTa classification alone: P(benign)=0.86, P(suspicious)=0.12. Below alert threshold.
+
+Context fusion sees:
+- customer has no declared children in KYC
+- counterparty_country_risk = 0.78
+- counterparty_first_time = 1
+- recent_pattern: 7 similar small "school fees" payments in last 30 days to 7 different recipients in same country
+- entropy_recent_counterparty = high (1.94)
+- model1_score = 0.31
+
+Fused output: 0.61. **In uncertainty band → LLM escalation.**
+
+LLM packet includes: the narrative, the prior 7 narratives ("for tuition", "school sponsorship", "education support", etc., all to different recipients), KYC summary, country context. LLM returns:
+
+> "Pattern of small payments framed as education-related expenses to multiple unrelated recipients in [country]. Customer has no declared educational sponsorship activity in KYC, no children listed, and no documented religious or charitable affiliation that would explain this pattern. Recipient diversity combined with thematic consistency in narratives suggests a dispersal pattern with cover language. Recommend escalation."
+
+LLM-augmented score: 0.87. **Alert with LLM-drafted SAR narrative attached.**
+
+The current BNP-SPI keyword rule never sees this because "school fees" is not a watchlist keyword. Model 5 catches it via context aggregation across multiple transactions plus LLM reasoning.
+
+---
+
+# Model 6 — Flow-Through / Pass-Through Detection (BNP-FTF)
+
+## Architecture in detail
+
+Three components plus a graph backbone:
+
+**Backbone — Customer-counterparty transaction graph in Neo4j (or Tigergraph).** Nodes: customers and external counterparties (resolved via Foundational Layer 1). Edges: directed, weighted by aggregate transaction volume and count, with edge attributes for transaction type mix and recency. Refreshed nightly.
+
+**Component A — Graph feature extraction.** Nightly batch job computes per-customer features from the graph using Neo4j's graph data science library or equivalent:
+- `pass_through_ratio_30d` = min(gross_in, gross_out) / max(gross_in, gross_out) — values near 1 are pass-through; near 0 are accumulation or disbursement
+- `median_holding_time_30d` = median FIFO-matched time from credit to corresponding debit
+- `in_out_counterparty_overlap` = |incoming_ctpys ∩ outgoing_ctpys| / |union| — legitimate operating accounts often have high overlap (you pay the suppliers who also are sometimes customers); layering accounts have near-zero overlap
+- `counterparty_country_entropy_in/out`
+- `counterparty_avg_risk_in/out` (using Model 1 scores for BNPP-customer counterparties, external risk proxy for others)
+- `graph_distance_to_nearest_sar_entity` (BFS hops)
+- `community_id` and `community_avg_risk` (Louvain community detection on the graph)
+- `fan_pattern_classification` — a small classifier output that buckets the customer's local subgraph into one of: "one-to-many", "many-to-one", "many-to-many", "few-to-few", "isolated"
+
+**Component B — XGBoost classifier.** Consumes graph features + transaction-flow features + customer features (including Model 1 score). ~300 trees, depth 5. Output P(suspicious pass-through).
+
+**Component C — Alert payload generator.** For alerts, generates a graph visualization payload — the customer's local neighborhood with risk-tinted nodes and edge weights — for L2 investigator consumption. Without this, the alert is uninterpretable.
+
+**Optional Component D — GraphSAGE (Phase 2).** For hard cases, train a GraphSAGE node-classification model on SAR-labeled subgraphs. Adds 3-5% net detection on the most complex layering networks where engineered features miss the pattern.
+
+## Training
+
+Labels: customers with SAR filed citing RT#25 typology in past 3 years = positive (~600 for a Tier-1 bank). Negatives: customers with high pass-through ratio but long tenure and no SAR (escrow services, payroll providers, treasury accounts) — these are *hard negatives* and critical for the model to learn from. Without aggressive hard-negative mining, the model will just learn "high pass-through ratio = bad" and recreate the current rule's FP problem.
+
+## Worked example — logistics company (FP elimination)
+
+€15M monthly gross turnover, €200k net change. Existing rule currently fires monthly.
+
+Feature vector:
+- in_degree_30d = 47 (47 distinct paying customers)
+- out_degree_30d = 23 (suppliers + employees)
+- gross_in = €14.9M; gross_out = €14.7M
+- pass_through_ratio_30d = 0.987 (very high)
+- median_holding_time_30d = 8.4 days (funds held meaningfully — pay terms)
+- **in_out_counterparty_overlap = 0.02** (different counterparties in vs out, expected for a logistics business)
+- counterparty_country_entropy_in = 1.84 (diverse client base — multiple countries)
+- counterparty_country_entropy_out = 1.12 (concentrated supplier countries)
+- counterparty_avg_risk_in = 0.18; counterparty_avg_risk_out = 0.14 (clean both sides)
+- graph_distance_to_nearest_sar = 4+ hops
+- community_avg_risk = 0.21 (logistics community, low risk)
+- fan_pattern = "many-to-many"
+- declared_business_type = "logistics services" (KYC)
+- model1_score = 0.22
+
+XGBoost reasoning (key tree paths):
+- `pass_through_ratio > 0.9` AND `median_holding_time > 5 days` → leaf value lowered by 0.08 (legitimate business holds funds)
+- `counterparty_avg_risk_in < 0.25` AND `counterparty_avg_risk_out < 0.25` → leaf value −0.05
+- `declared_business_type == "logistics"` AND `fan_pattern == "many-to-many"` → −0.04 (sector-pattern match)
+- `model1_score < 0.30` → −0.04
+
+Raw score: 0.14. Calibrated: 0.07. Threshold: 0.45. **Suppressed.**
+
+## Worked example — individual layering pattern (TP retention + new graph detail)
+
+Salaried individual receives €8k from 12 distinct originators in country A over 5 days, sends €92k to 3 beneficiaries in country B over the next 3 days.
+
+Feature vector:
+- in_degree_30d = 12
+- out_degree_30d = 3
+- pass_through_ratio_30d = 0.94
+- median_holding_time_30d = 1.2 days (very fast)
+- in_out_counterparty_overlap = 0.0 (zero — classic layering signal)
+- counterparty_country_entropy_in = 0.31 (originators clustered, low entropy)
+- counterparty_avg_risk_in = 0.62 (originators are higher-risk)
+- declared_business_type = "salaried individual"
+- graph_distance_to_nearest_sar = 2 hops
+- model1_score = 0.51
+
+XGBoost: raw 0.84, calibrated 0.79. **Alert.** Graph payload visualizes the fan-in / fan-out structure for L2 — they see the actual topology, not just numbers.
+
+## Worked example — multi-account layering ring (new detection)
+
+Four individual accounts of related individuals (resolved via Foundational Layer 1 — shared address, shared phone). Each account individually has pass-through ratio 0.62 — below the rule threshold of 0.85. But viewed as a community, the four accounts function as a single pass-through unit: money in via 30 originators across the four, out via 8 beneficiaries across the four, with internal transfers between the four accounts.
+
+Single-customer features wouldn't flag this. But:
+- Louvain community detection groups the four accounts into one community
+- Community-level pass-through ratio = 0.93
+- Community-level in_out_counterparty_overlap = 0.01
+- Community Model 1 average score is moderate
+- The four entities share resolved attributes (same physical address)
+
+A community-aware version of Model 6 (or the GraphSAGE Phase 2 layer) catches this pattern. Score 0.82, alert with community graph payload.
+
+This is **net new detection** — the current rule cannot see multi-account layering at all.
+
+---
+
+# Model 7 — Structuring & Scattering Detector (BNP-STP all 4 variants)
+
+## Architecture in detail
+
+Three components:
+
+**Component A — Window-based statistical feature extractor.** For each customer, slides 7-day, 14-day, and 30-day windows over the transaction history (per direction in/out, per instrument). For each window, computes:
+
+- `count_in_threshold_band` — transactions in [threshold × 0.85, threshold]
+- `count_total_in_window`
+- `density_band_ratio` = count_in_band / count_total (proportion of transactions clustered just below threshold)
+- `amount_std_in_window` (low std with high count = signal)
+- `amount_std_in_band` 
+- `benford_first_digit_kl` — KL divergence between observed first-digit distribution and Benford's expected distribution (legitimate financial data follows Benford; structured amounts often violate it)
+- `time_interval_std` — irregularity of time deltas between transactions (very regular = automated structuring signal)
+- `counterparty_concentration_hhi` — Herfindahl index on beneficiaries (1.0 = all to one beneficiary; close to 0 = scattered)
+- `branch_concentration_hhi` for cash deposits
+- `aggregate_value_below_threshold` — sum of below-threshold transactions in window
+- `sequential_instrument_flag` — for cash equivalents (cashier's checks, money orders), are serial numbers sequential?
+
+**Component B — 1D CNN over transaction sequence.** Per window, transactions are encoded as a sequence of per-transaction feature vectors (amount, time delta from previous, counterparty embedding, instrument type). Three parallel 1D convolutional branches with kernel sizes 3, 5, 7 detect local patterns at different scales. Global max-pool + concatenate + dense layer. Output: 32-dim pattern embedding.
+
+**Component C — Score fusion + L1-regularized logistic regression.** Statistical features + CNN embedding → logistic regression. L1 regularization for interpretability — every alert produces a sparse set of contributing features that L2 can read.
+
+## Per-rule routing
+
+| Rule variant | Direction | Pattern type | Primary features |
+|---|---|---|---|
+| BNP-STP-EFT-INN-SCT | Incoming | Scatter | Counterparty entropy, density_band |
+| BNP-STP-EFT-INN-TRD | Incoming | Trade/sequential | Same counterparty, sequential_instrument |
+| BNP-STP-EFT-OUT-SCT | Outgoing | Scatter | Beneficiary entropy, density_band |
+| BNP-STP-EFT-OUT-TRD | Outgoing | Trade/sequential | Same beneficiary, sequential pattern |
+
+## Worked example — classic cash structuring (TP retention + enrichment)
+
+11 cash deposits of €9,400–€9,800 over 9 days, at different branches, all followed by same-day onward wires to the same beneficiary.
+
+Window features (9-day window, cash, incoming):
+- count_in_threshold_band (threshold €10k, band €8,500–€10k) = 11
+- count_total_in_window = 11
+- density_band_ratio = 1.0 (every transaction in band — extreme signal)
+- amount_std_in_band = €124 (very tight clustering)
+- benford_first_digit_kl = 0.71 (heavily skewed to 9, violates Benford)
+- branch_concentration_hhi = 0.18 (11 different branches — distributed deposits)
+- aggregate_below_threshold = €106,500
+- onward_wire_counterparty_concentration = 1.0 (single beneficiary on outgoing leg)
+
+CNN sees the pattern: tight amount cluster, regular cadence, multi-branch dispersal feeding a single onward destination.
+- Statistical features → logistic regression contribution: 0.78
+- CNN pattern embedding contribution: 0.16
+- Fused score: 0.94. **Alert with explanation: density_band_ratio=1.0, amount_std=€124, multi-branch + single-beneficiary onward pattern.**
+
+## Worked example — jewelry retailer (FP elimination)
+
+Daily €8k–€10k cash deposits as normal trading. Falls in structuring band but legitimate.
+
+Window features:
+- count_in_threshold_band (30-day window) = 22
+- count_total_in_window = 28
+- density_band_ratio = 0.79 (high but not extreme — some legitimate transactions outside band)
+- amount_std_in_band = €640 (wider spread than structuring)
+- benford_first_digit_kl = 0.18 (closer to Benford-natural)
+- branch_concentration_hhi = 0.92 (single branch — fixed retail location)
+- counterparty_concentration_hhi on onward wires = 0.15 (many suppliers, not one beneficiary)
+- declared_sector = "jewelry retail" (KYC)
+- peer_group_band_ratio_avg = 0.71 (other jewelers similar)
+- 18_month_baseline = consistent
+
+Fused score: 0.11. **Suppressed.**
+
+## Worked example — uneven amounts that aggregate (new detection rule currently misses)
+
+Customer makes 14 cash deposits in 8 days: €7,847; €8,210; €6,930; €8,455; €7,120; €9,380; €7,705; €8,890; €6,540; €9,110; €8,230; €7,495; €8,925; €7,310. Total: €112,045. Onward wires to single beneficiary in corridor country.
+
+Window features:
+- count_in_strict_threshold_band (€8,500–€10k) = 4 (only 4 deposits in the narrow band — current rule misses)
+- count_in_loose_band (€6,500–€10k) = 14
+- amount_std_in_loose_band = €822 (low for the count and aggregate)
+- benford_first_digit_kl = 0.42 (skewed toward 7, 8, 9; away from 1, 2, 3 — abnormal)
+- counterparty_concentration_hhi on onward = 1.0 (single corridor beneficiary)
+- aggregate_below_threshold = €112,045
+- 90-day prior cash deposit volume = €4,500 (massive deviation from baseline)
+- onward_destination_country_risk = 0.78
+
+The strict density rule wouldn't fire (only 4 transactions in the narrow band). But the model's Benford deviation + low std + onward concentration + baseline deviation produce:
+
+Fused score: 0.78. **Alert.** Explanation cites Benford skew + low amount variance + onward concentration + customer-baseline deviation. This is the kind of "intelligent structuring with deliberately uneven amounts" that pure density rules can't catch.
+
+## Worked example — sequential cashier's check pattern (RT#54 new detection)
+
+Customer purchases 6 cashier's checks at the bank, serial numbers 4082, 4083, 4084, 4085, 4086, 4087, each in amount €4,800. Below reporting threshold individually but the sequential numbering is itself the signal.
+
+- count_in_band = 6
+- sequential_instrument_flag = 1 (consecutive serial numbers — automated detection from instrument-issuance system)
+- amount_std = €0 (identical amounts)
+- aggregate = €28,800
+
+This pattern is hard for rules to catch because each individual instrument is legitimate; only the sequence is suspicious. Model 7's sequential_instrument_flag, combined with the identical amounts feature, produces fused score 0.88. **Alert.**
+
+---
+
+## A few practical notes that apply across all 7 models
+
+**Calibration validation.** For each model, the calibrated probability must match observed SAR rates at each score bucket. If the model says "0.7" and only 5% of those actually file SARs, your operations and your model risk team will lose trust fast. Recalibrate quarterly using rolling outcomes data.
+
+**SHAP at inference.** Every alert ships with the top-5 contributing features and their attribution magnitudes. L2 sees not just "score 0.82" but "score 0.82 driven by: in_out_counterparty_overlap=0.0 (+0.34), counterparty_country_risk=0.78 (+0.21), graph_distance_to_sar=2 (+0.15), …". This is what makes ML-prioritized alerts actually faster to dispose of than rule alerts.
+
+**Training data refresh cadence.** Models 1, 2, 3, 6, 7 retrain quarterly on rolling 3-year windows. Model 4 retrains semi-annually (events are rarer). Model 5 retrains semi-annually but the LLM component is updated more often.
+
+**Champion-challenger deployment.** When deploying a new model version, run it as challenger in shadow mode for 60-90 days, comparing its alerts to production. Only promote when (a) FP rate doesn't worsen, (b) SAR-relevant detections aren't lost, (c) model risk validation completes. Document everything for the regulator.
+
+**The full feature-engineering / training pipeline for any one of these models** is a 2-3 month engineering effort with a team of two — say so explicitly in any planning conversation. Anyone scoping this in weeks is underestimating.
+
+Want me to take any single model deeper — say, the actual SHAP integration pattern, or the training pipeline code structure, or the validation tests model risk would expect to see for one of these?
