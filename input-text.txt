@@ -1,0 +1,76 @@
+STRUCTURED REQUIREMENTS CAPTURE — Alert Assignment Module
+1. Module identity & context
+
+Module name: Alert Assignment Module (Intelligent Alert Routing)
+Position: Investigation layer, entry point. Receives the packaged Alert Object after it is "raised" by Layer 5 (Alerts Packaging & Distribution) and routes it to the L1 analyst tier for first review.
+Purpose of the wider workflow it serves: L1 analysts review potential money-laundering alerts on transactions, determine True Positive / False Positive, and decide whether an alert should be escalated toward SAR filing.
+Note on terminology: your framework already uses "L1/L2/L3" for Alert Object payload levels. Here "L1" means the first analyst review tier. (Flagged for confirmation — see Q12.)
+
+2. Objective of this module
+
+Intelligently assign each raised alert to the correct analyst using a rule engine + system logic, so the right expertise handles the right alert and team workload is managed properly.
+Core principle: a complex typology on a specific product routes to an analyst who is "Champion" in that product + typology.
+
+3. Roles & permissions
+
+L1 Analyst: receives assigned alerts; can request re-assignment of an alert to someone else, with a specified reason (request goes to Team Lead).
+Team Lead: can set/edit analysts' skills and expertise levels; can manually assign and re-assign alerts; receives and acts on analyst re-assignment requests.
+Head of Team: can also set skills and expertise levels.
+
+4. Core entities & data
+4a. Workforce Skill Inventory (the basis for assignment)
+
+Holds, per analyst: their certified product types, certified risk typologies, and expertise level for them.
+Expertise levels (3): Trainee → Certified → Champion.
+Maintained by Team Lead / Head of Team.
+
+4b. Analyst operational attributes (used by the engine)
+
+Current backlog (open/assigned alerts).
+Efficiency rate — the rate at which the analyst clears alerts.
+Availability — driven by analyst calendars and leaves, which the system must identify and sync.
+
+4c. Alert Object (the unit being assigned)
+
+Carries: Product, Risk typology, and alert details.
+Expected close timeline — the timeline within which the alert is expected to be closed (used in assignment).
+
+5. Functional capabilities
+F-1. Skill & Certification Management
+
+Team Lead / Head of Team set and edit each analyst's product certifications, typology certifications, and expertise level (Trainee/Certified/Champion).
+
+F-2. Workforce Skill Inventory
+
+Central store of all analysts with their levels, skills, and expertise; queried by the assignment engine.
+
+F-3. Calendar & Leave Sync
+
+System identifies and syncs analysts' calendars and leaves to factor availability into assignment.
+
+F-4. Intelligent Assignment Engine (rule engine)
+
+Eligibility match: analyst must be certified for the alert's product and risk typology, at the required expertise level (complex → Champion).
+Optimization factors: current backlog, efficiency rate, expected close timeline, and availability (calendar/leave).
+
+F-5. Manual Assignment / Re-assignment (Team Lead)
+
+Team Lead can override the engine to assign or re-assign any alert to a chosen analyst.
+
+F-6. Analyst-initiated Re-assignment Request
+
+Analyst submits a re-assignment request with a mandatory reason → routed to Team Lead.
+
+6. UI / screens implied
+
+Skill Inventory management screen (Team Lead / Head): view & edit per-analyst products, typologies, expertise levels.
+Assignment dashboard (Team Lead): see alerts, assignments, backlogs, availability; manual assign/re-assign.
+Analyst worklist: assigned alerts; raise a re-assignment request with reason.
+Re-assignment request handling (Team Lead inbox).
+Calendar/leave view feeding availability.
+
+7. Integrations
+
+Upstream: Layer 5 Alerts Packaging (consumes the raised Alert Object).
+Internal: Workforce Skill Inventory; calendar/leave source.
+Downstream (context only): L1 disposition → escalation → SAR path.
