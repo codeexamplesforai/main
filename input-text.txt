@@ -1,3 +1,40 @@
+Ok, so now you already have seen the AML framework that we are trying to build in the previous chats, Now we want to start writing functional specification document for one of the modules in the investigation layer of this framework where a set of analysts reviews these potentail money laundering alerts on transactions and identify if they are true or false and if they should be escalated for SAR filing eventually.
+So for this, after alert is packaged and raised, it will first go to L1 for which we need write this alert Assignment module, the idea is that we intelligently assign these alerts to analysts from compliance based on certain rules and system so they go to correct person and the management can be done properly.
+So here, How it starts is, All the analysts should be mapped or certified for certain product type and risk typology where the analyst will have an expertise level, like start with Trainee, then certified and then champiagn, 3 levels. Now this is something that can be set by team lead or head of the team. Now we need to intelligently write an alert assignment algorithm or rule engine that assigns alert to correct person based on his certification and expert level, so an alert on complex typology for specific product goes to applicable  analyst who is champiagn in that.
+We also need to check the current backlog, efficiency rate (the rate at which that analyst clears alerts) and timeline in which that alert is expected to close, we also need to identify and sign up the calendars and leaves of these analysts, so it is assigned intellegently. So workforce skill inventory is there where all the levels and their skills and expertise are there, based on that we assign alert. For each alert, we will have details like Product, risk typology and details available for it. The team lead has rights to set the skills and expertise and also assign and re-assign alerts manually to someone, the analyst who has got alert can also have option to ask team lead to re-assign this to someone, with a specified reason.
+
+So you need to have UI, features, etcs, to do all this. Now write a detailed, list of details/points/prompt for the system that would read this information and eventually, generate the prompt for me. You just need to generate a structure information for me with all the required details without missing any that i have mentioned here. Ask me if any questions, dont assume.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 STRUCTURED REQUIREMENTS CAPTURE — Alert Assignment Module
 1. Module identity & context
 
