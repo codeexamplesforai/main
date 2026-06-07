@@ -1,0 +1,14 @@
+.claude/skills/fsd-builder/
+├── SKILL.md
+└── references/
+    └── fsd-structure.md
+
+
+
+
+
+
+
+.opencode/
+├── commands/fsd.md
+└── agents/fsd-writer.md
