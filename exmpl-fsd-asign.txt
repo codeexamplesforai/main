@@ -1,0 +1,124 @@
+1. How complexity is identified
+
+  Complexity is not computed from the alert's content (amount, geography,
+  transaction pattern, etc.). It's a governed static attribute on the taxonomy:
+
+  - Every (Product × Risk-typology) pair carries a label: Standard or Complex
+  (just two values in v1).
+  - That label is set and maintained by the AML SME (S-05) / Head of Team (S-03)
+  — not the engine (BR-02, FR-402).
+  - So "is this complex?" is answered by a lookup, not a calculation.
+
+  ▎ ⚠️  This is one of your [CONFIRM] items (A-09 / D-03). The mechanism is
+  ▎ locked, but the actual classification of each pair is provisional and needs
+  ▎ the AML SME to populate it. Also note v1 is deliberately binary — there's no
+  ▎ "medium" tier and no content-based scoring. If the business actually wants
+  ▎ complexity inferred from alert attributes, that's a different design and
+  ▎ should be raised now.
+
+  The mapping from complexity → required expertise (BR-02, the DMN-style
+  decision table):
+
+  ┌──────────────────────────────┬──────────────────────┬───────────────────┐
+  │   Complexity of (Product,    │    Min. required     │  Eligible levels  │
+  │          Typology)           │      expertise       │                   │
+  ├──────────────────────────────┼──────────────────────┼───────────────────┤
+  │ Standard                     │ Certified            │ Certified,        │
+  │                              │                      │ Champion          │
+  ├──────────────────────────────┼──────────────────────┼───────────────────┤
+  │ Complex                      │ Champion             │ Champion only     │
+  └──────────────────────────────┴──────────────────────┴───────────────────┘
+
+  Two hard rules sit on top: Trainees are never auto-assigned (BR-02), and the
+  engine never silently downgrades the requirement (BR-03 / FR-407) — a Complex
+  alert with no Champion free goes to a queue, it does not fall back to a
+  Certified analyst.
+
+  2. The assignment algorithm (the pipeline)
+
+  For each raised alert, the engine runs these steps in order (FR-401→FR-408):
+
+  1. Validate the Alert Object has Product, Risk typology, details,
+  Expected-close timeline (FR-401). Missing → reject.
+  2. Derive required expertise by looking up the (Product, Typology) complexity
+  (FR-402).
+  3. Eligibility match — analysts certified for that Product and Typology,
+  at-or-above the required level (FR-403, BR-01/BR-06; higher level satisfies
+  lower).
+  4. Availability filter — drop anyone unavailable across the Expected-close
+  window (FR-404).
+  5. Deterministic ranking (FR-405, BR-05) — a lexicographic tie-break (not a
+  weighted score). Each step only breaks ties left by the previous one:
+    a. Availability / remaining capacity across the window
+    b. Lowest backlog
+    c. Highest efficiency rate
+    d. Earliest projected completion within the timeline
+    e. Lowest stable analyst ID (guarantees exactly one winner, always)
+  6. Assign + record an explainable, immutable decision (FR-406) — captures the
+  eligibility basis and the ranking that picked them.
+  7. Fallback ladder if nobody eligible-and-available: queue as
+  NO_ELIGIBLE_ANALYST → Team Lead (FR-407) → escalate to Head of Team after 30
+  min (FR-408).
+
+  3. Worked example
+
+  Incoming alert: Product = Wire Transfer, Typology = Trade-Based Money
+  Laundering (TBML), Expected-close = 48h.
+
+  Step 2 — complexity lookup: the taxonomy has (Wire Transfer, TBML) = Complex →
+  required expertise = Champion (FR-402).
+
+  Analyst pool:
+
+  ┌─────────┬──────────────┬───────────┬─────────────┬─────────┬────────────┐
+  │         │  Certified   │           │ Available   │         │            │
+  │ Analyst │ for (Wire,   │   Level   │  next 48h?  │ Backlog │ Efficiency │
+  │         │    TBML)?    │           │             │         │            │
+  ├─────────┼──────────────┼───────────┼─────────────┼─────────┼────────────┤
+  │ A-17    │ ✅           │ Champion  │ ✅          │ 12      │ 0.80       │
+  ├─────────┼──────────────┼───────────┼─────────────┼─────────┼────────────┤
+  │ A-09    │ ✅           │ Champion  │ ✅          │ 12      │ 0.92       │
+  ├─────────┼──────────────┼───────────┼─────────────┼─────────┼────────────┤
+  │ A-23    │ ✅           │ Certified │ ✅          │ 3       │ 0.95       │
+  ├─────────┼──────────────┼───────────┼─────────────┼─────────┼────────────┤
+  │ A-31    │ ✅           │ Champion  │ ❌ (on      │ 1       │ 0.99       │
+  │         │              │           │ leave)      │         │            │
+  └─────────┴──────────────┴───────────┴─────────────┴─────────┴────────────┘
+
+  Step 3 — eligibility match (Champion only): A-17 and A-09 qualify. A-23 is
+  dropped (only Certified — and critically, the engine will not downgrade to
+  give it to her even though she has the lowest backlog and highest efficiency).
+  A-31 qualifies on level.
+
+  Step 4 — availability filter: A-31 removed (on leave across the window).
+  Survivors: A-17, A-09.
+
+  Step 5 — lexicographic ranking:
+  - Step 1 (availability/capacity): both available — tie.
+  - Step 2 (backlog): both 12 — tie.
+  - Step 3 (efficiency): A-09 = 0.92 > A-17 = 0.80 → A-09 wins.
+
+  Step 6 — assign to A-09, and write the decision record: "Required Champion
+  (Wire×TBML = Complex); eligible {A-17, A-09} after availability; selected A-09
+  — tie on capacity & backlog broken by efficiency 0.92 vs 0.80."
+
+  Counterfactual — the fallback path: if A-17, A-09, and A-31 had all been
+  unavailable, the only remaining certified person is A-23 (Certified, not
+  Champion). Because the typology is Complex, the engine does not assign to her.
+  The alert goes to the Unassigned (Pending) queue → Team Lead, who may
+  manually override to A-23 — but only with a captured justification, logged as
+  an exception visible to the Head of Team (BR-03 / FR-502). After 30 min
+  unassigned, it escalates to the Head of Team (FR-408).
+
+  ---
+  The key design decisions to validate with your stakeholders:
+  1. Complexity is a manual per-pair label, not inferred from alert data —
+  confirm that's the intent (and get the AML SME to actually classify the
+  pairs).
+  2. Ranking is strict lexicographic, so a single factor (e.g., efficiency)
+  fully decides once earlier factors tie — confirm the business doesn't prefer a
+  weighted model where backlog and efficiency trade off (that's flagged
+  [CONFIRM] A-11).
+  3. No silent downgrade means Complex alerts can sit pending rather than go to
+  a lower-tier analyst — confirm that's the desired risk posture (it protects
+  quality but can delay routing).
