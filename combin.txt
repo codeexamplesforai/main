@@ -1,0 +1,36 @@
+CHUNK_SIZE = 2_097_135  # 20,97,135 bytes
+
+def split_file(input_path, chunk_size=CHUNK_SIZE, output_prefix='part'):
+    """Split a file into consecutive chunks of `chunk_size` bytes each."""
+    output_files = []
+    with open(input_path, 'rb') as f:
+        index = 0
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            out_name = f'{output_prefix}_{index}'
+            with open(out_name, 'wb') as out:
+                out.write(chunk)
+            output_files.append(out_name)
+            index += 1
+    return output_files
+
+
+def join_parts(part_files, output_path):
+    """Reassemble split parts back into the original file."""
+    with open(output_path, 'wb') as out:
+        for name in part_files:
+            with open(name, 'rb') as f:
+                out.write(f.read())
+
+
+# Example usage
+if __name__ == '__main__':
+    #parts = split_file('en-tech-stack.txt')
+    #print(f'Created {len(parts)} parts:')
+    #for p in parts:
+    #    print(p)
+
+    # To reassemble:
+    join_parts(parts, 'encoded_rejoined.txt')
