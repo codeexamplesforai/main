@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""
+keep_awake.py — Prevents your Mac from sleeping by:
+  1. Running macOS's built-in `caffeinate` (blocks display + system + disk sleep,
+     which also keeps network connections alive)
+  2. Jiggling the mouse cursor slightly every INTERVAL seconds
+     (keeps you "active" in apps like Teams/Slack)
+
+Usage:
+    pip install pyautogui
+    python3 keep_awake.py            # jiggle every 60s (default)
+    python3 keep_awake.py 30         # jiggle every 30s
+
+Stop with Ctrl+C (or slam the mouse to the top-left corner — pyautogui failsafe).
+
+Note: The first run will ask for Accessibility permission:
+System Settings → Privacy & Security → Accessibility → allow Terminal/your IDE.
+"""
+
+import subprocess
+import sys
+import time
+import signal
+
+try:
+    import pyautogui
+except ImportError:
+    sys.exit("pyautogui not installed. Run:  pip install pyautogui")
+
+INTERVAL = int(sys.argv[1]) if len(sys.argv) > 1 else 60  # seconds between jiggles
+JIGGLE_PIXELS = 2
+
+pyautogui.FAILSAFE = True  # move mouse to top-left corner to abort instantly
+
+caffeinate_proc = None
+
+
+def start_caffeinate():
+    """-d display, -i idle/system, -m disk, -s AC sleep — covers everything."""
+    global caffeinate_proc
+    try:
+        caffeinate_proc = subprocess.Popen(["caffeinate", "-dims"])
+        print("caffeinate started (system/display/disk sleep blocked)")
+    except FileNotFoundError:
+        print("caffeinate not found — relying on mouse jiggle only")
+
+
+def cleanup(*_):
+    if caffeinate_proc:
+        caffeinate_proc.terminate()
+    print("\nStopped. Your Mac can sleep normally again.")
+    sys.exit(0)
+
+
+def main():
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    start_caffeinate()
+    print(f"Jiggling mouse {JIGGLE_PIXELS}px every {INTERVAL}s. Ctrl+C to stop.\n")
+
+    while True:
+        try:
+            x, y = pyautogui.position()
+            pyautogui.moveRel(JIGGLE_PIXELS, 0, duration=0.1)
+            pyautogui.moveRel(-JIGGLE_PIXELS, 0, duration=0.1)
+            # tiny keep-alive nudge without disturbing your actual position
+            pyautogui.moveTo(x, y)
+            print(f"jiggled at {time.strftime('%H:%M:%S')}", end="\r")
+        except pyautogui.FailSafeException:
+            cleanup()
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
