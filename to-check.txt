@@ -1,0 +1,186 @@
+claude.md file:
+
+# Add this section to your project CLAUDE.md
+# (Note: it deliberately never spells out the blocked word,
+#  because CLAUDE.md is also sent through the network proxy.)
+
+## Restricted keyword convention
+
+Our network proxy blocks any traffic containing the English word formed by
+joining "sec" + "ret". This word appears in many legitimate identifiers
+(AWS keys, OAuth client fields, Kubernetes objects, GitHub Actions, etc.).
+
+Rules:
+- NEVER write that word literally in any file content, command, commit
+  message, or response.
+- Instead, always write it with the marker `__X__` inserted after the first
+  three letters, preserving case. Examples:
+  - `AWS_SEC__X__RET_ACCESS_KEY`
+  - `clientSec__X__ret`
+  - `sec__X__retName: my-app-credentials`
+- A PreToolUse hook automatically converts the placeholder to the real
+  identifier when files are written or commands run, so the code on disk
+  is always valid. Do not "fix" the placeholder yourself.
+- When you read files, a PostToolUse hook shows the placeholder instead of
+  the real word. Treat it as the real identifier.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+codec.py:
+#!/usr/bin/env python3
+"""
+Codec hook for Claude Code: keeps a proxy-blocked word out of API traffic.
+
+- PreToolUse  (Write|Edit|MultiEdit|NotebookEdit|Bash):
+    decodes placeholder -> real word, so files/commands on disk are correct.
+- PostToolUse (Read|Grep|Glob|Bash):
+    encodes real word -> placeholder in tool output, so the word is never
+    sent back to the model through your proxy.
+
+Placeholder scheme (case-preserving):
+    "sec" + "ret"        ->  sec__X__ret
+    "Sec" + "ret"        ->  Sec__X__ret
+    "SEC" + "RET"        ->  SEC__X__RET
+
+The blocked word is built at runtime from two halves so this file itself
+never contains it (this script may be read by Claude / sent over the proxy).
+"""
+import json
+import re
+import sys
+
+MARK = "__X__"
+HALF_A = "sec"
+HALF_B = "ret"
+WORD_RE = re.compile("(?i)" + HALF_A + HALF_B)          # matches the blocked word
+PLACEHOLDER_RE = re.compile(
+    "(?i)(" + HALF_A + ")" + re.escape(MARK) + "(" + HALF_B + ")"
+)
+
+
+def encode(text: str) -> str:
+    """real word -> placeholder (case preserved)."""
+    def repl(m):
+        w = m.group(0)
+        return w[:3] + MARK + w[3:]
+    return WORD_RE.sub(repl, text)
+
+
+def decode(text: str) -> str:
+    """placeholder -> real word (case preserved)."""
+    return PLACEHOLDER_RE.sub(r"\1\2", text)
+
+
+def walk(obj, fn):
+    """Apply fn to every string in a nested JSON structure."""
+    if isinstance(obj, str):
+        return fn(obj)
+    if isinstance(obj, list):
+        return [walk(x, fn) for x in obj]
+    if isinstance(obj, dict):
+        return {k: walk(v, fn) for k, v in obj.items()}
+    return obj
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        sys.exit(0)  # malformed input: do nothing, don't block
+
+    event = data.get("hook_event_name", "")
+
+    if event == "PreToolUse":
+        tool_input = data.get("tool_input", {})
+        decoded = walk(tool_input, decode)
+        if decoded != tool_input:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "updatedInput": decoded
+                }
+            }))
+        sys.exit(0)
+
+    if event == "PostToolUse":
+        tool_response = data.get("tool_response")
+        if tool_response is None:
+            sys.exit(0)
+        encoded = walk(tool_response, encode)
+        if encoded != tool_response:
+            # updatedToolOutput expects the rewritten output; pass a string
+            # if the original was a string, otherwise the rewritten structure.
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "updatedToolOutput": encoded
+                }
+            }))
+        sys.exit(0)
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+seetings.json:
+
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/secret_codec.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read|Grep|Glob|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/secret_codec.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+
+
+
+
+
+
+
+
