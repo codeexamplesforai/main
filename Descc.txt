@@ -1,0 +1,41 @@
+Here's a tight executive talking track for the Functional Architecture slide — roughly 3–4 minutes of speaking time:
+
+---
+
+**Opening (frame the "why")**
+
+"This slide shows how G.A.M.M.A works end to end. The key message: we're moving from static, rule-heavy alerting to a layered, self-tuning risk engine — one that's globally consistent but locally calibrated. Let me walk you through it left to right."
+
+**Data Inputs**
+
+"Everything starts with three standardized feeds — our AML data layer, transaction profiles, and list management. Standardized inputs are what make the framework global and agnostic: the same engine works for any business line, country, or product without rebuilding logic."
+
+**Global Tuning Matrix (the green banner)**
+
+"Sitting above the pipeline is the Global Tuning Matrix — the single control panel for the entire framework. It calibrates model sensitivity across five dimensions: country, client type, product, risk level, and transactional profile. This is how one global model behaves correctly in every jurisdiction — we tune parameters, not code. And every change is maker-checker approved and fully audit-trailed, which matters for regulators."
+
+**The five layers (keep it fast)**
+
+"Detection then flows through five layers:
+
+- **Layer 1, the Feature Factory** — one centralized data-preparation engine. Every risk feature is defined once and reused everywhere, so 'the same feature means the same thing' across the enterprise.
+- **Layer 2, the Model Layer** — the objective calculator. It blends deterministic rules, hybrid, and ML models, plus unsupervised anomaly detection that catches *novel* patterns no rule exists for yet. Every signal gets a normalized 0-to-1 score instead of a binary yes/no.
+- **Layer 3, the Signal Aggregator** — consolidates all signals into one holistic risk profile per client or account, with full data lineage preserved.
+- **Layer 4, the Risk Appetite Layer** — where policy meets detection. Track A auto-escalates non-negotiable risks like sanctions hits; Track B uses ML to catch entities sitting just below thresholds whose *combined* behavior is suspicious. That dual-track design is how we cut false positives without missing true risk.
+- **Layer 5, Alerts Packaging** — builds fully explainable, typology-specific alerts and delivers them straight into the case management system, batch or real-time."
+
+**Feedback Loop (the differentiator — slow down here)**
+
+"The bottom of the slide is what makes this fundamentally different from today. Investigation outcomes — true and false positives — flow back into the system automatically. That drives threshold recalibration, feature improvement, and entity-level score adjustment. Today, tuning thresholds is a manual analytics exercise; here, the system learns from every closed case."
+
+**Simulation Framework**
+
+"Finally, the simulation sandbox lets us test new typologies and thresholds against *live production data* in shadow mode — no impact on compliance operations, and near-zero rework to promote to production. That dramatically shortens time-to-market for new detection scenarios."
+
+**Close**
+
+"So in one sentence: G.A.M.M.A gives us a globally consistent, locally tuned, fully explainable detection engine that continuously improves itself — better risk capture, fewer false positives, less manual effort, and audit-ready by design."
+
+---
+
+Want a 60-second condensed version as well, in case you get cut short on time? 
