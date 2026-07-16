@@ -1,0 +1,28 @@
+Here's a more polished and professional version of your email while preserving your key points and technical observations:
+
+
+---
+
+Hi Simone,
+
+This certainly looks interesting and appears to align well with several AML use cases. Many of the algorithms described have direct relevance to transaction monitoring, where clustering is already a core technique. The specific pain points they claim to address are genuine challenges in this domain.
+
+A few potential applications that stand out are:
+
+Customer/Entity Segmentation: Grouping customers based on behavioural patterns to define more effective risk-based monitoring thresholds for segments or smaller peer groups.
+
+Anomaly Detection: Identifying transactions or accounts that do not fit into any cluster, or that lie at the boundaries of clusters. These could naturally highlight scenarios such as structuring, mule accounts, unusual transaction flows, etc.
+
+Peer Group Analysis: Comparing an entity against similar peers within its cluster to identify behavioural deviations.
+
+Alert Prioritisation: Clustering alerts themselves to support investigation prioritisation or risk-based alert scoring.
+
+
+What particularly caught my attention is the emphasis on deterministic clustering. In a highly regulated environment like AML, determinism is valuable because it makes models more explainable, reproducible, and auditable. Traditional K-means, with its random initialisation, can produce different results across runs, making governance and validation more challenging. If their approach truly delivers reproducible clustering while eliminating random seeds, it would address an important model governance requirement.
+
+Another interesting aspect is their ability to explore segmentations at different levels of granularity, which is highly relevant since client segmentation in AML is often somewhat arbitrary and difficult to justify objectively.
+
+Overall, this looks promising and worth exploring further. From what I understand, the solution is currently published through Azure Foundry or a similar platform, so I'm not sure how easily we can evaluate it using live examples. If possible, we could ask them to run their techniques on an open AML dataset (or, ideally, IBM's AML dataset) and share the results in the form of a white paper or technical report. That would allow us to better assess, validate, and understand their approach before considering it further.
+
+
+--- 
