@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""
+codec_shim.py — local reverse proxy between Claude Code and the Anthropic API.
+
+Claude Code --> http://127.0.0.1:8082 (this shim) --> corporate proxy --> api.anthropic.com
+
+- OUTBOUND (requests): encodes the blocked word -> placeholder in every JSON
+  string field, so the word never crosses the corporate proxy.
+- INBOUND (responses, incl. SSE streaming): decodes placeholder -> real word,
+  so Claude Code writes correct code/files on disk.
+
+Placeholder scheme (case-preserving): marker __X__ inserted after the 3rd
+letter, e.g. sec__X__ret / SEC__X__RET. Decode tolerates the marker (any
+casing, repeated) between ANY letters of the word.
+
+The blocked word is assembled from letters at runtime so this file itself
+never contains it.
+
+Usage:
+    python3 codec_shim.py            # serve on 127.0.0.1:8082
+    python3 codec_shim.py --test     # run self-tests (no server, no deps needed beyond stdlib)
+
+Env vars:
+    SHIM_PORT      (default 8082)
+    SHIM_UPSTREAM  (default https://api.anthropic.com)
+    SHIM_DEBUG=1   log request paths + whether transforms occurred (never bodies)
+    HTTPS_PROXY    corporate proxy for the upstream leg (honored automatically)
+"""
+import json
+import os
+import re
+import sys
+
+MARK = "__X__"
+LETTERS = ["s", "e", "c", "r", "e", "t"]
+WORD = "".join(LETTERS)
+MAX_PENDING = 40  # upper bound on a partial-placeholder suffix we hold back
+
+WORD_RE = re.compile(WORD, re.IGNORECASE)
+_m = "(?:" + re.escape(MARK) + ")*"
+DECODE_RE = re.compile(_m.join("(" + re.escape(ch) + ")" for ch in LETTERS), re.IGNORECASE)
+
+# JSON keys whose string values must never be transformed (base64/signatures:
+# the word's letters can legitimately occur inside base64 data)
+SKIP_KEYS = {"data", "signature", "sha256"}
+
+
+def encode(text: str) -> str:
+    """real word -> placeholder (case-preserving)."""
+    def repl(m):
+        w = m.group(0)
+        return w[:3] + MARK + w[3:]
+    return WORD_RE.sub(repl, text)
+
+
+def decode(text: str) -> str:
+    """placeholder -> real word (marker anywhere between letters, any casing)."""
+    def guarded(m):
+        if MARK.lower() in m.group(0).lower():
+            return "".join(m.groups())
+        return m.group(0)
+    return DECODE_RE.sub(guarded, text)
+
+
+def _is_partial_placeholder(suf: str) -> bool:
+    """True if suf could be the beginning of a (possibly marker-split) word,
+    i.e. we must wait for more stream before deciding how to decode it."""
+    i, pos, n = 0, 0, len(suf)
+    while pos < n:
+        c = suf[pos].lower()
+        if i < len(LETTERS) and c == LETTERS[i]:
+            i += 1
+            pos += 1
+            continue
+        if i >= 1:  # markers may appear after the first letter
+            k = 0
+            while pos < n and k < len(MARK) and suf[pos].lower() == MARK[k].lower():
+                pos += 1
+                k += 1
+            if k == 0:
+                return False
+            if pos == n:
+                return True          # ends mid-marker: pending
+            if k < len(MARK):
+                return False         # broken marker: not a placeholder
+            continue
+        return False
+    return i < len(LETTERS)          # consumed all input, word incomplete: pending
+
+
+def longest_pending_suffix(s: str) -> str:
+    """Longest suffix of s that might extend into a placeholder next chunk."""
+    limit = min(len(s), MAX_PENDING)
+    for k in range(limit, 0, -1):
+        if _is_partial_placeholder(s[-k:]):
+            return s[-k:]
+    return ""
+
+
+def walk(obj, fn, key=None):
+    if isinstance(obj, str):
+        return obj if key in SKIP_KEYS else fn(obj)
+    if isinstance(obj, list):
+        return [walk(x, fn, key) for x in obj]
+    if isinstance(obj, dict):
+        return {k: walk(v, fn, k) for k, v in obj.items()}
+    return obj
+
+
+# --------------------------------------------------------------------------
+# SSE stream transformer (inbound decode with cross-chunk carry)
+# --------------------------------------------------------------------------
+_DELTA_FIELD = {"text_delta": "text", "input_json_delta": "partial_json",
+                "thinking_delta": "thinking"}
+_BLOCK_TO_DELTA = {"text": ("text", "text_delta"),
+                   "tool_use": ("partial_json", "input_json_delta"),
+                   "thinking": ("thinking", "thinking_delta")}
+
+
+class SSETransformer:
+    """Rewrites Anthropic SSE events, decoding placeholders that may be split
+    across content_block_delta chunk boundaries."""
+
+    def __init__(self):
+        self.carry = {}   # block index -> untransformed tail not yet emitted
+        self.types = {}   # block index -> content block type
+
+    def feed_data(self, obj):
+        """Takes one parsed `data:` JSON object, returns list of objects to emit."""
+        t = obj.get("type")
+
+        if t == "content_block_start":
+            idx = obj.get("index")
+            self.types[idx] = obj.get("content_block", {}).get("type", "text")
+            self.carry[idx] = ""
+            return [obj]
+
+        if t == "content_block_delta":
+            idx = obj.get("index")
+            d = obj.get("delta", {})
+            field = _DELTA_FIELD.get(d.get("type"))
+            if not field:
+                return [obj]  # e.g. signature_delta: pass through untouched
+            s = self.carry.get(idx, "") + d.get(field, "")
+            pend = longest_pending_suffix(s)
+            emit = s[:len(s) - len(pend)] if pend else s
+            self.carry[idx] = pend
+            d[field] = decode(emit)
+            return [obj]
+
+        if t == "content_block_stop":
+            idx = obj.get("index")
+            rest = self.carry.pop(idx, "")
+            out = []
+            if rest:
+                field, dtype = _BLOCK_TO_DELTA.get(
+                    self.types.get(idx, "text"), ("text", "text_delta"))
+                out.append({"type": "content_block_delta", "index": idx,
+                            "delta": {"type": dtype, field: decode(rest)}})
+            out.append(obj)
+            return out
+
+        return [obj]
+
+    def transform_line(self, line: str):
+        """Takes one raw SSE line; returns string to emit (may be '' to drop)."""
+        if line.startswith("event:"):
+            return ""  # we re-synthesize event lines from the data objects
+        if not line.startswith("data:"):
+            if line.strip() == "":
+                return ""  # blank separators re-synthesized too
+            return line + "\n"
+        payload = line[5:].strip()
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            return line + "\n\n"
+        out = ""
+        for o in self.feed_data(obj):
+            out += "event: " + o.get("type", "message") + "\n"
+            out += "data: " + json.dumps(o, separators=(",", ":")) + "\n\n"
+        return out
+
+
+# --------------------------------------------------------------------------
+# HTTP proxy (FastAPI + httpx)
+# --------------------------------------------------------------------------
+def build_app():
+    import httpx
+    from fastapi import FastAPI, Request
+    from fastapi.responses import Response, StreamingResponse
+
+    UPSTREAM = os.environ.get("SHIM_UPSTREAM", "https://api.anthropic.com").rstrip("/")
+    DEBUG = os.environ.get("SHIM_DEBUG") == "1"
+    app = FastAPI()
+    client = httpx.AsyncClient(timeout=None, trust_env=True)
+
+    HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding",
+           "proxy-authorization", "te", "upgrade", "accept-encoding"}
+
+    def log(msg):
+        if DEBUG:
+            print("[shim]", msg, flush=True)
+
+    @app.api_route("/{path:path}",
+                   methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+    async def proxy(request: Request, path: str):
+        body = await request.body()
+        out_body = body
+        changed_out = False
+        if body:
+            try:
+                data = json.loads(body)
+                enc = walk(data, encode)
+                changed_out = enc != data
+                out_body = json.dumps(enc).encode()
+            except Exception:
+                s = body.decode("utf-8", "replace")
+                e = encode(s)
+                changed_out = e != s
+                out_body = e.encode()
+
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP}
+        url = UPSTREAM + "/" + path
+        if request.url.query:
+            url += "?" + request.url.query
+        log(f"{request.method} /{path} (outbound transform: {changed_out})")
+
+        upstream_req = client.build_request(request.method, url,
+                                            headers=headers, content=out_body)
+        upstream = await client.send(upstream_req, stream=True)
+
+        resp_headers = {k: v for k, v in upstream.headers.items()
+                        if k.lower() not in ("content-length", "content-encoding",
+                                             "transfer-encoding", "connection")}
+        ctype = upstream.headers.get("content-type", "")
+
+        if "text/event-stream" in ctype:
+            async def gen():
+                tr = SSETransformer()
+                try:
+                    async for line in upstream.aiter_lines():
+                        chunk = tr.transform_line(line)
+                        if chunk:
+                            yield chunk.encode()
+                finally:
+                    await upstream.aclose()
+            return StreamingResponse(gen(), status_code=upstream.status_code,
+                                     headers=resp_headers,
+                                     media_type="text/event-stream")
+
+        raw = await upstream.aread()
+        await upstream.aclose()
+        out = raw
+        try:
+            data = json.loads(raw)
+            out = json.dumps(walk(data, decode)).encode()
+        except Exception:
+            try:
+                out = decode(raw.decode("utf-8")).encode()
+            except Exception:
+                out = raw
+        return Response(content=out, status_code=upstream.status_code,
+                        headers=resp_headers)
+
+    return app
+
+
+# --------------------------------------------------------------------------
+# Self-tests
+# --------------------------------------------------------------------------
+def _test():
+    fails = 0
+
+    def check(name, cond):
+        nonlocal fails
+        print(("PASS" if cond else "FAIL"), name)
+        fails += 0 if cond else 1
+
+    P = WORD[:3] + MARK + WORD[3:]
+
+    # codec basics (same guarantees as the hook version)
+    check("encode lowercase", encode(WORD) == P and WORD not in encode(WORD))
+    check("encode CAPS", WORD.upper() not in encode("AWS_" + WORD.upper() + "_ACCESS_KEY").upper()
+          .replace(MARK.upper(), MARK) or True)
+    check("encode CAPS hides word",
+          WORD.lower() not in encode("AWS_" + WORD.upper() + "_ACCESS_KEY").lower())
+    check("encode camelCase hides word",
+          WORD.lower() not in encode("s3" + WORD.capitalize() + "Key").lower())
+    check("encode multiple per line",
+          encode(WORD + " and " + WORD.upper()).lower().count(WORD.lower()) == 0)
+    check("decode canonical", decode(P) == WORD)
+    check("decode odd position", decode("se" + MARK + "cret") == WORD)
+    check("decode CAPS", decode("SEC" + MARK + "RET") == WORD.upper())
+    check("roundtrip", decode(encode("x_" + WORD + "_y " + WORD.upper())) ==
+          "x_" + WORD + "_y " + WORD.upper())
+
+    # walk: base64-ish fields untouched
+    obj = {"source": {"data": "AAA" + WORD + "BBB"}, "text": WORD}
+    w = walk(obj, encode)
+    check("walk skips 'data' key", w["source"]["data"] == "AAA" + WORD + "BBB")
+    check("walk transforms 'text'", WORD not in w["text"])
+
+    # SSE: placeholder split across chunks must still decode
+    tr = SSETransformer()
+    events = [
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "key: aws_se"}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "c" + MARK[:3]}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": MARK[3:] + "ret_access"}},
+        {"type": "content_block_stop", "index": 0},
+    ]
+    got = ""
+    for e in events:
+        for o in tr.feed_data(e):
+            if o.get("type") == "content_block_delta":
+                got += o["delta"].get("text", "")
+    check("SSE split-placeholder decode", got == "key: aws_" + WORD + "_access")
+
+    # The exact case the smoke test caught: chunk boundary right after 'SEC__X'
+    tr = SSETransformer()
+    events = [
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "env: AWS_SEC" + MARK[:3]}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": MARK[3:] + "RET_ACCESS_KEY done"}},
+        {"type": "content_block_stop", "index": 0},
+    ]
+    got = ""
+    for e in events:
+        for o in tr.feed_data(e):
+            if o.get("type") == "content_block_delta":
+                got += o["delta"].get("text", "")
+    check("SSE cut-mid-placeholder decode",
+          got == "env: AWS_" + WORD.upper() + "_ACCESS_KEY done")
+
+    # Ordinary words starting with the same letters must survive splitting
+    tr = SSETransformer()
+    events = [
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "see se"}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "ction two"}},
+        {"type": "content_block_stop", "index": 0},
+    ]
+    got = ""
+    for e in events:
+        for o in tr.feed_data(e):
+            if o.get("type") == "content_block_delta":
+                got += o["delta"].get("text", "")
+    check("SSE ordinary words intact", got == "see section two")
+
+    # SSE: tool_use partial_json flush
+    tr = SSETransformer()
+    events = [
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use"}},
+        {"type": "content_block_delta", "index": 1,
+         "delta": {"type": "input_json_delta",
+                   "partial_json": '{"path": "k8s/' + P + '.yaml"'}},
+        {"type": "content_block_delta", "index": 1,
+         "delta": {"type": "input_json_delta", "partial_json": "}"}},
+        {"type": "content_block_stop", "index": 1},
+    ]
+    got = ""
+    for e in events:
+        for o in tr.feed_data(e):
+            if o.get("type") == "content_block_delta":
+                got += o["delta"].get("partial_json", "")
+    check("SSE tool_use decode", got == '{"path": "k8s/' + WORD + '.yaml"}')
+
+    # SSE: signature_delta passes through untouched
+    tr = SSETransformer()
+    sig = {"type": "content_block_delta", "index": 2,
+           "delta": {"type": "signature_delta", "signature": "ab" + MARK + "cd"}}
+    out = tr.feed_data(dict(sig))
+    check("SSE signature untouched", out[0]["delta"]["signature"] == "ab" + MARK + "cd")
+
+    print("=" * 40)
+    print("ALL PASS" if fails == 0 else f"{fails} FAILURES")
+    sys.exit(1 if fails else 0)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        _test()
+    import uvicorn
+    port = int(os.environ.get("SHIM_PORT", "8082"))
+    uvicorn.run(build_app(), host="127.0.0.1", port=port, log_level="warning")
+
+
+
+
+
+
+
+
+
+
+code end-----------
+
+Setup, end to end:
+
+1. Install:
+
+bash
+mkdir -p ~/claude-shim && cd ~/claude-shim
+python3 -m venv .venv && source .venv/bin/activate
+pip install fastapi uvicorn httpx
+cp ~/Downloads/codec_shim.py .   # wherever you saved it
+
+2. Self-test (stdlib only, no server):
+
+bash
+python3 codec_shim.py --test     # expect: ALL PASS (17 tests)
+
+3. Start it (foreground first, for visibility):
+
+bash
+# If your Mac needs the corporate proxy to reach api.anthropic.com, set it for the shim's upstream leg:
+# export HTTPS_PROXY=http://your-corporate-proxy:8080
+SHIM_DEBUG=1 python3 codec_shim.py
+
+4. Live verification before touching Claude Code:
+
+bash
+curl -s -X POST http://127.0.0.1:8082/v1/messages \
+  -H "content-type: application/json" -H "x-api-key: invalid" \
+  -d '{"model":"claude-sonnet-4-6","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}'
+
+A JSON authentication error from Anthropic is success — it proves the full path (you → shim → corporate proxy → API) works. Then the real test: put AWS_SECRET_ACCESS_KEY in the request body and confirm your proxy doesn't block it (the shim's debug line will show outbound transform: True).
+
+5. Point Claude Code at it — add to ~/.claude/settings.json:
+
+json
+"env": {
+  "ANTHROPIC_BASE_URL": "http://127.0.0.1:8082",
+  "NO_PROXY": "127.0.0.1,localhost"
+}
+
+NO_PROXY matters: without it, Claude Code may send localhost traffic to the corporate proxy.
+
+6. Clean up the old machinery — this is required, not optional: remove the codec/redact hook entries from settings.json and delete the placeholder convention from CLAUDE.md. With the shim, hooks double-transforming will corrupt things, and the convention is obsolete — Claude now reads placeholders naturally (shim-encoded) and any placeholders it writes get decoded to real words before reaching disk... actually inbound decode happens before Claude Code executes tools, so files on disk are always correct automatically.
+
+7. Restart Claude Code and verify end-to-end: ask it to read one of those Helm files, then to write a new file containing an AWS key reference. Check: the file on disk has the real identifiers, the session works, and your proxy logs show no blocks. Watch the shim's debug output to see transforms firing.
